@@ -1,5 +1,8 @@
 package de.chromefiles.app.ui
 
+import android.accounts.Account
+import android.accounts.AccountManager
+import android.app.Activity
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
@@ -10,8 +13,15 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.expandHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkHorizontally
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
@@ -24,6 +34,7 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.AlertDialog
@@ -32,9 +43,11 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
@@ -47,6 +60,7 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
@@ -61,6 +75,7 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
@@ -68,6 +83,8 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import de.chromefiles.app.model.FileOperationStatus
 import de.chromefiles.app.model.VfsNode
@@ -93,7 +110,7 @@ import de.chromefiles.app.ui.viewmodel.PaneState
 import java.io.File
 import kotlin.math.roundToInt
 
-private val COMPACT_WINDOW_WIDTH = 840.dp
+private val COMPACT_WINDOW_WIDTH = 760.dp
 private val DETAILS_PANEL_WIDTH = 320.dp
 
 /**
@@ -109,12 +126,24 @@ fun ChromeFilesScreen(
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
     val operations by viewModel.operations.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val snackbarHostState = remember { SnackbarHostState() }
     val rootFocus = remember { FocusRequester() }
     var rootIsFocused by remember { mutableStateOf(false) }
     var lastPressPosition by remember { mutableStateOf(Offset.Zero) }
     val areaStates = remember { mutableMapOf<String, FileAreaState>() }
     fun areaState(paneId: String) = areaStates.getOrPut(paneId) { FileAreaState() }
+
+    // Automatische Prüfung der Dateiberechtigung beim Zurückkehren aus den Android-Einstellungen
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                viewModel.refreshPermissionsState()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     LaunchedEffect(incomingUri, ui.focusedPaneId) {
         if (incomingUri != null && ui.focusedPaneId.isNotEmpty()) {
@@ -124,12 +153,15 @@ fun ChromeFilesScreen(
     }
 
     var pendingSafAsLinux by remember { mutableStateOf(false) }
+    var pendingSafAsGoogleDrive by remember { mutableStateOf(false) }
     val safTreeLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { treeUri ->
         if (treeUri != null) {
-            viewModel.onSafTreeSelected(treeUri, pendingSafAsLinux)
+            viewModel.onSafTreeSelected(treeUri, pendingSafAsLinux, pendingSafAsGoogleDrive)
         }
+        pendingSafAsLinux = false
+        pendingSafAsGoogleDrive = false
     }
     val allFilesAccessLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -153,7 +185,64 @@ fun ChromeFilesScreen(
     }
     fun launchSafFolderPicker(asLinuxContainer: Boolean) {
         pendingSafAsLinux = asLinuxContainer
+        pendingSafAsGoogleDrive = false
         runCatching { safTreeLauncher.launch(null) }
+    }
+    fun launchGoogleDriveSafPicker() {
+        pendingSafAsLinux = false
+        pendingSafAsGoogleDrive = true
+        val initialDriveUri = Uri.parse("content://com.google.android.apps.docs.storage/root")
+        runCatching { safTreeLauncher.launch(initialDriveUri) }.onFailure {
+            runCatching { safTreeLauncher.launch(null) }
+        }
+    }
+
+    var pendingGoogleAccount by remember { mutableStateOf<Account?>(null) }
+    val googleConsentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val acct = pendingGoogleAccount
+        if (result.resultCode == Activity.RESULT_OK && acct != null) {
+            requestGoogleAccountDriveToken(
+                context = context,
+                account = acct,
+                onToken = viewModel::connectDriveWithSystemAccountToken,
+                onConsentIntent = null
+            )
+        }
+    }
+    val googleAccountPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        val accountName = data?.getStringExtra(AccountManager.KEY_ACCOUNT_NAME)
+        val accountType = data?.getStringExtra(AccountManager.KEY_ACCOUNT_TYPE) ?: "com.google"
+        if (result.resultCode == Activity.RESULT_OK && !accountName.isNullOrBlank()) {
+            val account = Account(accountName, accountType)
+            pendingGoogleAccount = account
+            requestGoogleAccountDriveToken(
+                context = context,
+                account = account,
+                onToken = viewModel::connectDriveWithSystemAccountToken,
+                onConsentIntent = { consentIntent ->
+                    runCatching { googleConsentLauncher.launch(consentIntent) }
+                }
+            )
+        }
+    }
+    fun launchSystemGoogleAccountPicker() {
+        val intent = AccountManager.newChooseAccountIntent(
+            null,
+            null,
+            arrayOf("com.google"),
+            null,
+            null,
+            null,
+            null
+        )
+        runCatching { googleAccountPickerLauncher.launch(intent) }.onFailure {
+            viewModel.showDriveAuthDialog()
+        }
     }
 
     val focusedController = viewModel.pane(ui.focusedPaneId)
@@ -326,34 +415,36 @@ fun ChromeFilesScreen(
                 LaunchedEffect(isCompact) { viewModel.setSidebarCollapsed(isCompact) }
 
                 Row(modifier = Modifier.fillMaxSize()) {
-                    AnimatedVisibility(
-                        visible = !ui.isSidebarCollapsed,
-                        enter = expandHorizontally(),
-                        exit = shrinkHorizontally()
-                    ) {
-                        Row {
-                            NavigationSidebar(
-                                nodes = ui.sidebarNodes,
-                                volumes = ui.volumes,
-                                currentPath = focusedPane?.currentPath.orEmpty(),
-                                currentVolumeId = focusedPane?.currentVolumeId.orEmpty(),
-                                onNodeClick = viewModel::onSidebarNodeClicked,
-                                onToggleExpand = viewModel::toggleTreeNode,
-                                onEject = viewModel::ejectVolume,
-                                modifier = Modifier.width(ui.sidebarWidthDp.dp),
-                                canDrop = { node ->
-                                    node.volumeType != VfsVolumeType.MOUNTED_ARCHIVE &&
-                                        viewModel.canDropOn(DropDestination(node.path, node.volumeId))
-                                },
-                                onDrop = { node, payload ->
-                                    viewModel.handleDrop(payload, DropDestination(node.path, node.volumeId))
-                                },
-                                onAddNetwork = viewModel::showNetworkDialog,
-                                onAddSafFolder = { launchSafFolderPicker(asLinuxContainer = false) },
-                                onConnectDrive = viewModel::showDriveAuthDialog,
-                                isDriveConnected = ui.isDriveConnected
-                            )
-                            PaneResizeHandle(onDragDp = viewModel::resizeSidebarBy)
+                    if (!isCompact) {
+                        AnimatedVisibility(
+                            visible = !ui.isSidebarCollapsed,
+                            enter = expandHorizontally(),
+                            exit = shrinkHorizontally()
+                        ) {
+                            Row {
+                                NavigationSidebar(
+                                    nodes = ui.sidebarNodes,
+                                    volumes = ui.volumes,
+                                    currentPath = focusedPane?.currentPath.orEmpty(),
+                                    currentVolumeId = focusedPane?.currentVolumeId.orEmpty(),
+                                    onNodeClick = viewModel::onSidebarNodeClicked,
+                                    onToggleExpand = viewModel::toggleTreeNode,
+                                    onEject = viewModel::ejectVolume,
+                                    modifier = Modifier.width(ui.sidebarWidthDp.dp),
+                                    canDrop = { node ->
+                                        node.volumeType != VfsVolumeType.MOUNTED_ARCHIVE &&
+                                            viewModel.canDropOn(DropDestination(node.path, node.volumeId))
+                                    },
+                                    onDrop = { node, payload ->
+                                        viewModel.handleDrop(payload, DropDestination(node.path, node.volumeId))
+                                    },
+                                    onAddNetwork = viewModel::showNetworkDialog,
+                                    onAddSafFolder = { launchSafFolderPicker(asLinuxContainer = false) },
+                                    onConnectDrive = viewModel::showDriveAuthDialog,
+                                    isDriveConnected = ui.isDriveConnected
+                                )
+                                PaneResizeHandle(onDragDp = viewModel::resizeSidebarBy)
+                            }
                         }
                     }
 
@@ -361,7 +452,12 @@ fun ChromeFilesScreen(
                         modifier = Modifier
                             .weight(1f)
                             .fillMaxHeight()
-                            .padding(top = 8.dp, bottom = 8.dp, end = if (ui.isDetailsPanelVisible) 0.dp else 8.dp)
+                            .padding(
+                                start = if (isCompact) 8.dp else 0.dp,
+                                top = 8.dp,
+                                bottom = 8.dp,
+                                end = if (!isCompact && ui.isDetailsPanelVisible) 0.dp else 8.dp
+                            )
                     ) {
                         if (ui.tabPaneIds.size > 1) {
                             val tabs = ui.tabPaneIds.map { id ->
@@ -391,6 +487,8 @@ fun ChromeFilesScreen(
                                         onRequestKeyboardFocus = { runCatching { rootFocus.requestFocus() } },
                                         onRequestAllFilesAccess = ::launchAllFilesAccessSettings,
                                         onPickSafFolder = ::launchSafFolderPicker,
+                                        onPickGoogleDriveSaf = ::launchGoogleDriveSafPicker,
+                                        onPickSystemGoogleAccount = ::launchSystemGoogleAccountPicker,
                                         modifier = Modifier.weight(1f).fillMaxHeight()
                                     )
                                 }
@@ -398,23 +496,132 @@ fun ChromeFilesScreen(
                         }
                     }
 
+                    if (!isCompact) {
+                        AnimatedVisibility(
+                            visible = ui.isDetailsPanelVisible,
+                            enter = expandHorizontally(expandFrom = Alignment.Start),
+                            exit = shrinkHorizontally(shrinkTowards = Alignment.Start)
+                        ) {
+                            DetailsPanel(
+                                detailedNode = ui.detailedNode,
+                                selectedNodes = focusedPane?.selectedNodes.orEmpty(),
+                                currentFolderTitle = focusedPane?.title.orEmpty(),
+                                totalItemsInFolder = focusedPane?.nodes?.size ?: 0,
+                                onClose = viewModel::toggleDetailsPanel,
+                                onToggleOffline = viewModel::toggleOfflinePinned,
+                                onToggleStarred = viewModel::toggleStarred,
+                                onToggleColorTag = viewModel::toggleColorTag,
+                                onLoadLocalFile = viewModel::localFileFor,
+                                modifier = Modifier.width(DETAILS_PANEL_WIDTH)
+                            )
+                        }
+                    }
+                }
+
+                // Schmale Fenster / Portrait-Modus: Seitenleiste als modaler Slide-Over-Drawer
+                if (isCompact) {
+                    AnimatedVisibility(
+                        visible = !ui.isSidebarCollapsed,
+                        enter = fadeIn(),
+                        exit = fadeOut()
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.45f))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null
+                                ) { viewModel.setSidebarCollapsed(true) }
+                        )
+                    }
+                    AnimatedVisibility(
+                        visible = !ui.isSidebarCollapsed,
+                        enter = slideInHorizontally(initialOffsetX = { -it }),
+                        exit = slideOutHorizontally(targetOffsetX = { -it })
+                    ) {
+                        Surface(
+                            modifier = Modifier.width(292.dp).fillMaxHeight(),
+                            shape = RoundedCornerShape(topEnd = 20.dp, bottomEnd = 20.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            shadowElevation = 12.dp
+                        ) {
+                            NavigationSidebar(
+                                nodes = ui.sidebarNodes,
+                                volumes = ui.volumes,
+                                currentPath = focusedPane?.currentPath.orEmpty(),
+                                currentVolumeId = focusedPane?.currentVolumeId.orEmpty(),
+                                onNodeClick = { node ->
+                                    viewModel.onSidebarNodeClicked(node)
+                                    viewModel.setSidebarCollapsed(true)
+                                },
+                                onToggleExpand = viewModel::toggleTreeNode,
+                                onEject = viewModel::ejectVolume,
+                                modifier = Modifier.fillMaxSize(),
+                                canDrop = { node ->
+                                    node.volumeType != VfsVolumeType.MOUNTED_ARCHIVE &&
+                                        viewModel.canDropOn(DropDestination(node.path, node.volumeId))
+                                },
+                                onDrop = { node, payload ->
+                                    viewModel.handleDrop(payload, DropDestination(node.path, node.volumeId))
+                                },
+                                onAddNetwork = {
+                                    viewModel.setSidebarCollapsed(true)
+                                    viewModel.showNetworkDialog()
+                                },
+                                onAddSafFolder = {
+                                    viewModel.setSidebarCollapsed(true)
+                                    launchSafFolderPicker(asLinuxContainer = false)
+                                },
+                                onConnectDrive = {
+                                    viewModel.setSidebarCollapsed(true)
+                                    viewModel.showDriveAuthDialog()
+                                },
+                                isDriveConnected = ui.isDriveConnected
+                            )
+                        }
+                    }
+
                     AnimatedVisibility(
                         visible = ui.isDetailsPanelVisible,
-                        enter = expandHorizontally(expandFrom = Alignment.Start),
-                        exit = shrinkHorizontally(shrinkTowards = Alignment.Start)
+                        enter = fadeIn(),
+                        exit = fadeOut()
                     ) {
-                        DetailsPanel(
-                            detailedNode = ui.detailedNode,
-                            selectedNodes = focusedPane?.selectedNodes.orEmpty(),
-                            currentFolderTitle = focusedPane?.title.orEmpty(),
-                            totalItemsInFolder = focusedPane?.nodes?.size ?: 0,
-                            onClose = viewModel::toggleDetailsPanel,
-                            onToggleOffline = viewModel::toggleOfflinePinned,
-                            onToggleStarred = viewModel::toggleStarred,
-                            onToggleColorTag = viewModel::toggleColorTag,
-                            onLoadLocalFile = viewModel::localFileFor,
-                            modifier = Modifier.width(DETAILS_PANEL_WIDTH)
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color.Black.copy(alpha = 0.45f))
+                                .clickable(
+                                    interactionSource = remember { MutableInteractionSource() },
+                                    indication = null
+                                ) { viewModel.toggleDetailsPanel() }
                         )
+                    }
+                    AnimatedVisibility(
+                        visible = ui.isDetailsPanelVisible,
+                        enter = slideInHorizontally(initialOffsetX = { it }),
+                        exit = slideOutHorizontally(targetOffsetX = { it }),
+                        modifier = Modifier.align(Alignment.CenterEnd)
+                    ) {
+                        Surface(
+                            modifier = Modifier.width(DETAILS_PANEL_WIDTH).fillMaxHeight(),
+                            shape = RoundedCornerShape(topStart = 20.dp, bottomStart = 20.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerLow,
+                            shadowElevation = 12.dp
+                        ) {
+                            DetailsPanel(
+                                detailedNode = ui.detailedNode,
+                                selectedNodes = focusedPane?.selectedNodes.orEmpty(),
+                                currentFolderTitle = focusedPane?.title.orEmpty(),
+                                totalItemsInFolder = focusedPane?.nodes?.size ?: 0,
+                                onClose = viewModel::toggleDetailsPanel,
+                                onToggleOffline = viewModel::toggleOfflinePinned,
+                                onToggleStarred = viewModel::toggleStarred,
+                                onToggleColorTag = viewModel::toggleColorTag,
+                                onLoadLocalFile = viewModel::localFileFor,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
                     }
                 }
             }
@@ -483,6 +690,8 @@ fun ChromeFilesScreen(
             onBuildPkceUrl = viewModel::buildDrivePkceUrl,
             onConnectWithCode = viewModel::connectDriveWithCode,
             onConnectWithToken = viewModel::connectDriveWithToken,
+            onPickSystemGoogleAccount = ::launchSystemGoogleAccountPicker,
+            onPickGoogleDriveSaf = ::launchGoogleDriveSafPicker,
             onDisconnect = viewModel::disconnectDrive,
             onDismiss = viewModel::dismissDriveAuthDialog
         )
@@ -610,3 +819,33 @@ private fun openWithExternalApp(context: Context, node: VfsNode) {
         android.widget.Toast.makeText(context, "Keine App zum Öffnen von „${node.name}“ gefunden.", android.widget.Toast.LENGTH_LONG).show()
     }
 }
+
+private fun requestGoogleAccountDriveToken(
+    context: Context,
+    account: Account,
+    onToken: (String) -> Unit,
+    onConsentIntent: ((Intent) -> Unit)?
+) {
+    val accountManager = AccountManager.get(context)
+    val authTokenType = "oauth2:https://www.googleapis.com/auth/drive"
+    accountManager.getAuthToken(
+        account,
+        authTokenType,
+        null,
+        false,
+        { future ->
+            runCatching {
+                val bundle = future.result
+                val token = bundle.getString(AccountManager.KEY_AUTHTOKEN)
+                @Suppress("DEPRECATION")
+                val consentIntent = bundle.getParcelable<Intent>(AccountManager.KEY_INTENT)
+                when {
+                    !token.isNullOrBlank() -> onToken(token)
+                    consentIntent != null && onConsentIntent != null -> onConsentIntent(consentIntent)
+                }
+            }
+        },
+        null
+    )
+}
+

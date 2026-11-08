@@ -146,12 +146,13 @@ class ChromeFilesViewModel @Inject constructor(
         }
         viewModelScope.launch {
             repository.volumesFlow.collect { volumes ->
+                val driveConnected = repository.isDriveConnected()
                 _uiState.update {
                     it.copy(
                         volumes = volumes,
                         hasAllFilesAccess = repository.hasAllFilesAccess(),
                         isUsingDeviceStorage = repository.isUsingDeviceStorage(),
-                        isDriveConnected = repository.driveManager.isConnected()
+                        isDriveConnected = driveConnected
                     )
                 }
                 // Ausgeworfene Volumes: betroffene Ansichten zurück zu „Meine Dateien“.
@@ -445,33 +446,49 @@ class ChromeFilesViewModel @Inject constructor(
         }
     }
 
-    // ================================================================== SAF (Linux-Crostini / USB) & Gerätespeicher
+    // ================================================================== SAF (Linux-Crostini / USB / Google Drive) & Gerätespeicher
 
-    fun onSafTreeSelected(treeUri: Uri, asLinuxContainer: Boolean) {
+    fun onSafTreeSelected(treeUri: Uri, asLinuxContainer: Boolean, asGoogleDrive: Boolean = false) {
         viewModelScope.launch {
-            repository.safVolumes.registerTreeUri(treeUri, asLinuxContainer)
+            repository.safVolumes.registerTreeUri(treeUri, asLinuxContainer, asGoogleDrive)
                 .onSuccess { volume ->
                     repository.refreshVolumes()
-                    postMessage("„${volume.title}“ wurde über SAF eingebunden.")
+                    postMessage("„${volume.title}“ wurde erfolgreich eingebunden.")
                     focused?.navigateTo(volume.rootPath, volume.id)
                     rebuildSidebar()
                 }
                 .onFailure { err ->
-                    postMessage("SAF-Ordner konnte nicht eingebunden werden: ${err.message}")
+                    postMessage("Ordner konnte nicht eingebunden werden: ${err.message}")
                 }
+        }
+    }
+
+    /** Wird beim Zurückkehren aus den Android-Systemeinstellungen (ON_RESUME) automatisch aufgerufen. */
+    fun refreshPermissionsState() {
+        viewModelScope.launch {
+            val wasGranted = _uiState.value.hasAllFilesAccess
+            val nowGranted = repository.hasAllFilesAccess()
+            if (wasGranted != nowGranted) {
+                repository.refreshVolumes()
+                reloadAllPanes()
+                rebuildSidebar()
+                if (nowGranted) {
+                    postMessage("Lokaler Gerätespeicher freigegeben (${repository.myFilesRoot.absolutePath}).")
+                }
+            }
         }
     }
 
     fun onAllFilesAccessResult() {
         viewModelScope.launch {
             val granted = repository.hasAllFilesAccess()
+            repository.refreshVolumes()
+            reloadAllPanes()
             if (granted) {
-                repository.setUseDeviceStorage(true)
                 focused?.navigateTo(repository.myFilesRoot.absolutePath, VOLUME_MY_FILES)
                 postMessage("Vollständiger Dateizugriff aktiviert (${repository.myFilesRoot.absolutePath}).")
             } else {
-                repository.refreshVolumes()
-                postMessage("Berechtigung nicht erteilt – App-Sandbox bleibt aktiv.")
+                postMessage("Bitte „Zugriff auf alle Dateien“ aktivieren, um das lokale Dateisystem anzuzeigen.")
             }
             rebuildSidebar()
         }
@@ -479,18 +496,13 @@ class ChromeFilesViewModel @Inject constructor(
 
     fun toggleDeviceStorageMode() {
         viewModelScope.launch {
-            val next = !repository.isUsingDeviceStorage()
-            repository.setUseDeviceStorage(next)
+            repository.refreshVolumes()
             focused?.navigateTo(repository.myFilesRoot.absolutePath, VOLUME_MY_FILES)
-            postMessage(
-                if (next) "Gerätespeicher aktiviert (${repository.myFilesRoot.absolutePath})."
-                else "App-Sandbox für „Meine Dateien“ aktiviert."
-            )
             rebuildSidebar()
         }
     }
 
-    // ================================================================== Google Drive REST API v3 (OAuth 2.0)
+    // ================================================================== Google Drive REST API v3 (OAuth 2.0 & Android System-Konto)
 
     fun savedDriveClientId(): String = repository.driveManager.savedClientId()
 
@@ -514,6 +526,22 @@ class ChromeFilesViewModel @Inject constructor(
         if (_uiState.value.driveAuthDialog?.isConnecting == true) return
         repository.driveManager.stopLoopbackListener()
         _uiState.update { it.copy(driveAuthDialog = null) }
+    }
+
+    fun connectDriveWithSystemAccountToken(accessToken: String) {
+        viewModelScope.launch {
+            repository.driveManager.connectWithAccessToken(accessToken, "", "")
+                .onSuccess { info ->
+                    repository.refreshVolumes()
+                    _uiState.update { it.copy(driveAuthDialog = null) }
+                    postMessage("Google Drive verbunden (${info.email}).")
+                    focused?.navigateTo(de.chromefiles.app.data.drive.GoogleDriveManager.ROOT_MY_DRIVE, VOLUME_DRIVE)
+                    rebuildSidebar()
+                }
+                .onFailure { err ->
+                    postMessage("Google-Drive-Anmeldung fehlgeschlagen: ${err.message}")
+                }
+        }
     }
 
     fun connectDriveWithCode(clientId: String, codeOrUrl: String) {
@@ -558,11 +586,10 @@ class ChromeFilesViewModel @Inject constructor(
 
     fun disconnectDrive() {
         viewModelScope.launch {
-            repository.driveManager.disconnect()
-            repository.refreshVolumes()
+            repository.ejectVolume(VOLUME_DRIVE)
             _uiState.update { it.copy(driveAuthDialog = null) }
-            postMessage("Google Drive getrennt – lokale Demo-Ablage aktiv.")
-            focused?.navigateTo(repository.googleDriveRoot.absolutePath, VOLUME_DRIVE)
+            postMessage("Google Drive wurde getrennt.")
+            focused?.navigateTo(VirtualFileSystemRepository.UNCONNECTED_DRIVE_PATH, VOLUME_DRIVE)
             rebuildSidebar()
         }
     }

@@ -47,7 +47,9 @@ class SafVolumeManager @Inject constructor(
         const val SAF_SCHEME = "saf://"
         const val PROTOCOL_SAF = "SAF"
         const val PROTOCOL_SAF_LINUX = "SAF_LINUX"
+        const val PROTOCOL_SAF_DRIVE = "SAF_DRIVE"
         const val LINUX_SAF_VOLUME_ID = "linux_files_saf"
+        const val DRIVE_SAF_VOLUME_ID = "google_drive_saf"
     }
 
     fun isSafPath(path: String): Boolean = path.startsWith(SAF_SCHEME)
@@ -63,7 +65,8 @@ class SafVolumeManager @Inject constructor(
      */
     suspend fun registerTreeUri(
         treeUri: Uri,
-        asLinuxContainer: Boolean = false
+        asLinuxContainer: Boolean = false,
+        asGoogleDrive: Boolean = false
     ): Result<VfsVolume> = withContext(Dispatchers.IO) {
         runCatching {
             val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
@@ -75,13 +78,22 @@ class SafVolumeManager @Inject constructor(
             val rawTitle = docFile.name?.takeIf { it.isNotBlank() }
                 ?: rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "Externer Ordner" }
 
-            val volumeId = if (asLinuxContainer) {
-                LINUX_SAF_VOLUME_ID
-            } else {
-                "saf_${UUID.randomUUID().toString().take(8)}"
+            val isDriveUri = asGoogleDrive || treeUri.authority?.contains("com.google.android.apps.docs") == true
+            val volumeId = when {
+                isDriveUri -> DRIVE_SAF_VOLUME_ID
+                asLinuxContainer -> LINUX_SAF_VOLUME_ID
+                else -> "saf_${UUID.randomUUID().toString().take(8)}"
             }
-            val title = if (asLinuxContainer) "Linux-Dateien" else rawTitle
-            val protocol = if (asLinuxContainer) PROTOCOL_SAF_LINUX else PROTOCOL_SAF
+            val title = when {
+                isDriveUri -> "Google Drive ($rawTitle)"
+                asLinuxContainer -> "Linux-Dateien"
+                else -> rawTitle
+            }
+            val protocol = when {
+                isDriveUri -> PROTOCOL_SAF_DRIVE
+                asLinuxContainer -> PROTOCOL_SAF_LINUX
+                else -> PROTOCOL_SAF
+            }
             val path = pathFor(volumeId, rootDocId)
 
             dao.upsertMountedConnection(
@@ -111,16 +123,25 @@ class SafVolumeManager @Inject constructor(
 
     fun toVfsVolume(entity: MountedConnectionEntity): VfsVolume {
         val isLinux = entity.protocol == PROTOCOL_SAF_LINUX || entity.volumeId == LINUX_SAF_VOLUME_ID
+        val isDrive = entity.protocol == PROTOCOL_SAF_DRIVE || entity.volumeId == DRIVE_SAF_VOLUME_ID
         val authority = runCatching { Uri.parse(entity.hostOrUri).authority.orEmpty() }.getOrDefault("")
         return VfsVolume(
-            id = if (isLinux) "linux_files" else entity.volumeId,
-            title = entity.title,
-            subtitle = if (isLinux) {
-                "Crostini SAF (${authority.ifBlank { "DocumentProvider" }})"
-            } else {
-                "SAF • ${entity.shareOrRemotePath}"
+            id = when {
+                isDrive -> "google_drive"
+                isLinux -> "linux_files"
+                else -> entity.volumeId
             },
-            type = if (isLinux) VfsVolumeType.LINUX_CROSTINI else VfsVolumeType.REMOVABLE_MEDIA,
+            title = if (isDrive) "Google Drive" else entity.title,
+            subtitle = when {
+                isDrive -> "Verbunden über Google Drive SAF (${entity.title})"
+                isLinux -> "Crostini SAF (${authority.ifBlank { "DocumentProvider" }})"
+                else -> "SAF • ${entity.shareOrRemotePath}"
+            },
+            type = when {
+                isDrive -> VfsVolumeType.GOOGLE_DRIVE
+                isLinux -> VfsVolumeType.LINUX_CROSTINI
+                else -> VfsVolumeType.REMOVABLE_MEDIA
+            },
             rootPath = entity.localMountPath,
             isEjectable = true,
             isExpandable = false,
@@ -357,7 +378,11 @@ class SafVolumeManager @Inject constructor(
     }
 
     suspend fun disconnect(volumeId: String) = withContext(Dispatchers.IO) {
-        val dbId = if (volumeId == "linux_files") LINUX_SAF_VOLUME_ID else volumeId
+        val dbId = when (volumeId) {
+            "linux_files" -> LINUX_SAF_VOLUME_ID
+            "google_drive" -> DRIVE_SAF_VOLUME_ID
+            else -> volumeId
+        }
         val conn = dao.getAllMountedConnections().firstOrNull { it.volumeId == dbId || it.volumeId == volumeId }
         if (conn != null) {
             val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION

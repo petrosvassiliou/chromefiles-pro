@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -129,85 +130,100 @@ fun ChromeOsTopBar(
     canDropOnBreadcrumb: (BreadcrumbSegment) -> Boolean = { false },
     onBreadcrumbDrop: (BreadcrumbSegment, DropPayload) -> Boolean = { _, _ -> false }
 ) {
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .height(56.dp)
-            .padding(horizontal = 8.dp),
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        if (showSidebarToggle) {
-            ToolbarIcon(Icons.Outlined.Menu, "Seitenleiste ein-/ausblenden", onClick = onToggleSidebar)
-        }
-        ToolbarIcon(Icons.AutoMirrored.Filled.ArrowBack, "Zurück (Alt + ←)", enabled = canGoBack, onClick = onBack)
-        ToolbarIcon(Icons.AutoMirrored.Filled.ArrowForward, "Vorwärts (Alt + →)", enabled = canGoForward, onClick = onForward)
-        Spacer(Modifier.width(4.dp))
-
-        Box(modifier = Modifier.weight(1f)) {
-            if (isSearchOpen) {
-                SearchField(query = searchQuery, onQueryChange = onSearchQueryChange, onClose = onCloseSearch)
-            } else {
-                BreadcrumbBar(
-                    segments = breadcrumbs,
-                    onSegmentClick = onBreadcrumbClick,
-                    canDropOn = canDropOnBreadcrumb,
-                    onDrop = onBreadcrumbDrop
-                )
-            }
-        }
-
-        if (!isSearchOpen) {
-            ToolbarIcon(Icons.Outlined.Search, "Suchen (Strg + F)", onClick = onOpenSearch)
-        }
-
-        if (isTrash) {
-            TextButton(onClick = onRestoreFromTrash, enabled = hasSelection) {
-                Icon(Icons.Outlined.RestoreFromTrash, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Wiederherstellen")
-            }
-            TextButton(onClick = onEmptyTrash) {
-                Icon(Icons.Outlined.DeleteForever, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Papierkorb leeren")
-            }
-        }
-
-        if (canCreateFolder) {
-            ToolbarIcon(Icons.Outlined.CreateNewFolder, "Neuer Ordner (Strg + E)", onClick = onNewFolder)
-        }
-        ToolbarIcon(
-            icon = if (viewMode == FileViewMode.LIST) Icons.Outlined.GridView else Icons.AutoMirrored.Outlined.ViewList,
-            label = if (viewMode == FileViewMode.LIST) "Rasteransicht" else "Listenansicht",
-            onClick = onToggleViewMode
-        )
-        SortMenuButton(sortSpec = sortSpec, onSortColumn = onSortColumn, onSortDirection = onSortDirection)
-
-        TooltipBox(
-            positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
-            tooltip = { PlainTooltip { Text("Datei-Info ein-/ausblenden") } },
-            state = rememberTooltipState()
+    BoxWithConstraints(modifier = modifier.fillMaxWidth()) {
+        val isCompactBar = maxWidth < 560.dp
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(56.dp)
+                .padding(horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            IconToggleButton(checked = isDetailsPanelVisible, onCheckedChange = { onToggleDetails() }) {
-                Icon(
-                    Icons.Outlined.Info,
-                    contentDescription = "Datei-Info",
-                    tint = if (isDetailsPanelVisible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+            if (showSidebarToggle) {
+                ToolbarIcon(Icons.Outlined.Menu, "Seitenleiste ein-/ausblenden", onClick = onToggleSidebar)
+            }
+            if (!isCompactBar || canGoBack) {
+                ToolbarIcon(Icons.AutoMirrored.Filled.ArrowBack, "Zurück (Alt + ←)", enabled = canGoBack, onClick = onBack)
+            }
+            if (!isCompactBar) {
+                ToolbarIcon(Icons.AutoMirrored.Filled.ArrowForward, "Vorwärts (Alt + →)", enabled = canGoForward, onClick = onForward)
+            }
+            Spacer(Modifier.width(2.dp))
+
+            Box(modifier = Modifier.weight(1f)) {
+                if (isSearchOpen) {
+                    SearchField(query = searchQuery, onQueryChange = onSearchQueryChange, onClose = onCloseSearch)
+                } else {
+                    BreadcrumbBar(
+                        segments = breadcrumbs,
+                        onSegmentClick = onBreadcrumbClick,
+                        canDropOn = canDropOnBreadcrumb,
+                        onDrop = onBreadcrumbDrop
+                    )
+                }
+            }
+
+            if (!isSearchOpen) {
+                ToolbarIcon(Icons.Outlined.Search, "Suchen (Strg + F)", onClick = onOpenSearch)
+            }
+
+            if (isTrash && !isCompactBar) {
+                TextButton(onClick = onRestoreFromTrash, enabled = hasSelection) {
+                    Icon(Icons.Outlined.RestoreFromTrash, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Wiederherstellen")
+                }
+                TextButton(onClick = onEmptyTrash) {
+                    Icon(Icons.Outlined.DeleteForever, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Papierkorb leeren")
+                }
+            }
+
+            if (canCreateFolder && !isSearchOpen) {
+                ToolbarIcon(Icons.Outlined.CreateNewFolder, "Neuer Ordner (Strg + E)", onClick = onNewFolder)
+            }
+            if (!isSearchOpen) {
+                ToolbarIcon(
+                    icon = if (viewMode == FileViewMode.LIST) Icons.Outlined.GridView else Icons.AutoMirrored.Outlined.ViewList,
+                    label = if (viewMode == FileViewMode.LIST) "Rasteransicht" else "Listenansicht",
+                    onClick = onToggleViewMode
                 )
             }
+            if (!isCompactBar) {
+                SortMenuButton(sortSpec = sortSpec, onSortColumn = onSortColumn, onSortDirection = onSortDirection)
+
+                TooltipBox(
+                    positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+                    tooltip = { PlainTooltip { Text("Datei-Info ein-/ausblenden") } },
+                    state = rememberTooltipState()
+                ) {
+                    IconToggleButton(checked = isDetailsPanelVisible, onCheckedChange = { onToggleDetails() }) {
+                        Icon(
+                            Icons.Outlined.Info,
+                            contentDescription = "Datei-Info",
+                            tint = if (isDetailsPanelVisible) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            MoreMenuButton(
+                showHiddenFiles = showHiddenFiles,
+                hasAllFilesAccess = hasAllFilesAccess,
+                isDriveConnected = isDriveConnected,
+                isDetailsPanelVisible = isDetailsPanelVisible,
+                isTrash = isTrash,
+                hasSelection = hasSelection,
+                onToggleHiddenFiles = onToggleHiddenFiles,
+                onToggleDetails = onToggleDetails,
+                onRefresh = onRefresh,
+                onRestoreFromTrash = onRestoreFromTrash,
+                onEmptyTrash = onEmptyTrash,
+                onRequestAllFilesAccess = onRequestAllFilesAccess,
+                onPickSafFolder = onPickSafFolder,
+                onOpenDriveAuth = onOpenDriveAuth
+            )
         }
-        MoreMenuButton(
-            showHiddenFiles = showHiddenFiles,
-            hasAllFilesAccess = hasAllFilesAccess,
-            isUsingDeviceStorage = isUsingDeviceStorage,
-            isDriveConnected = isDriveConnected,
-            onToggleHiddenFiles = onToggleHiddenFiles,
-            onRefresh = onRefresh,
-            onRequestAllFilesAccess = onRequestAllFilesAccess,
-            onToggleDeviceStorage = onToggleDeviceStorage,
-            onPickSafFolder = onPickSafFolder,
-            onOpenDriveAuth = onOpenDriveAuth
-        )
     }
 }
 
@@ -436,12 +452,16 @@ private fun SortMenuButton(
 private fun MoreMenuButton(
     showHiddenFiles: Boolean,
     hasAllFilesAccess: Boolean,
-    isUsingDeviceStorage: Boolean,
     isDriveConnected: Boolean,
+    isDetailsPanelVisible: Boolean,
+    isTrash: Boolean,
+    hasSelection: Boolean,
     onToggleHiddenFiles: () -> Unit,
+    onToggleDetails: () -> Unit,
     onRefresh: () -> Unit,
+    onRestoreFromTrash: () -> Unit,
+    onEmptyTrash: () -> Unit,
     onRequestAllFilesAccess: () -> Unit,
-    onToggleDeviceStorage: () -> Unit,
     onPickSafFolder: (asLinuxContainer: Boolean) -> Unit,
     onOpenDriveAuth: () -> Unit
 ) {
@@ -449,6 +469,17 @@ private fun MoreMenuButton(
     Box {
         ToolbarIcon(Icons.Outlined.MoreVert, "Weitere Optionen", onClick = { open = true })
         DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+            DropdownMenuItem(
+                text = { Text("Datei-Info-Spalte") },
+                leadingIcon = {
+                    if (isDetailsPanelVisible) Icon(Icons.Filled.Check, contentDescription = null)
+                    else Icon(Icons.Outlined.Info, contentDescription = null)
+                },
+                onClick = {
+                    onToggleDetails()
+                    open = false
+                }
+            )
             DropdownMenuItem(
                 text = { Text("Versteckte Dateien anzeigen") },
                 leadingIcon = {
@@ -471,10 +502,30 @@ private fun MoreMenuButton(
                     open = false
                 }
             )
+            if (isTrash) {
+                HorizontalDivider()
+                DropdownMenuItem(
+                    text = { Text("Auswahl wiederherstellen") },
+                    enabled = hasSelection,
+                    leadingIcon = { Icon(Icons.Outlined.RestoreFromTrash, contentDescription = null) },
+                    onClick = {
+                        open = false
+                        onRestoreFromTrash()
+                    }
+                )
+                DropdownMenuItem(
+                    text = { Text("Papierkorb leeren") },
+                    leadingIcon = { Icon(Icons.Outlined.DeleteForever, contentDescription = null) },
+                    onClick = {
+                        open = false
+                        onEmptyTrash()
+                    }
+                )
+            }
             HorizontalDivider()
             if (!hasAllFilesAccess) {
                 DropdownMenuItem(
-                    text = { Text("Vollständigen Dateizugriff erteilen …") },
+                    text = { Text("Lokalen Dateizugriff freigeben …") },
                     onClick = {
                         open = false
                         onRequestAllFilesAccess()
@@ -482,15 +533,9 @@ private fun MoreMenuButton(
                 )
             } else {
                 DropdownMenuItem(
-                    text = { Text("Echten Gerätespeicher für „Meine Dateien“ nutzen") },
-                    leadingIcon = {
-                        if (isUsingDeviceStorage) Icon(Icons.Filled.Check, contentDescription = null)
-                        else Spacer(Modifier.size(24.dp))
-                    },
-                    onClick = {
-                        open = false
-                        onToggleDeviceStorage()
-                    }
+                    text = { Text("Gerätespeicher aktiv (/storage/emulated/0)") },
+                    leadingIcon = { Icon(Icons.Filled.Check, contentDescription = null) },
+                    onClick = { open = false }
                 )
             }
             DropdownMenuItem(
@@ -509,7 +554,7 @@ private fun MoreMenuButton(
             )
             DropdownMenuItem(
                 text = {
-                    Text(if (isDriveConnected) "Google Drive-Konto verwalten …" else "Google Drive (OAuth 2.0) verbinden …")
+                    Text(if (isDriveConnected) "Google Drive-Konto verwalten …" else "Google Drive verbinden …")
                 },
                 leadingIcon = {
                     if (isDriveConnected) Icon(Icons.Filled.Check, contentDescription = null)

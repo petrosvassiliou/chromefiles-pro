@@ -93,7 +93,7 @@ class VirtualFileSystemRepository @Inject constructor(
     }
 
     val sandboxMyFilesRoot: File
-        get() = File(sandboxRootDir, "Meine Dateien").apply { mkdirs() }
+        get() = File(sandboxRootDir, "Meine Dateien")
 
     /** Prüft, ob `MANAGE_EXTERNAL_STORAGE` (Zugriff auf alle Dateien) vom System gewährt wurde. */
     fun hasAllFilesAccess(): Boolean =
@@ -103,30 +103,48 @@ class VirtualFileSystemRepository @Inject constructor(
             true
         }
 
-    fun isUsingDeviceStorage(): Boolean =
-        hasAllFilesAccess() && prefs.getBoolean("use_device_storage", true)
+    fun isUsingDeviceStorage(): Boolean = hasAllFilesAccess()
 
     suspend fun setUseDeviceStorage(enabled: Boolean) {
         prefs.edit().putBoolean("use_device_storage", enabled).apply()
         refreshVolumes()
     }
 
+    /**
+     * Echter Gerätespeicher-Wurzelpfad:
+     * Auf ChromeOS `/mnt/chromeos/MyFiles`, ansonsten der primäre Android-Speicher (`/storage/emulated/0`).
+     * Es wird niemals auf einen künstlichen Sandbox-Ordner zurückgefallen!
+     */
     val myFilesRoot: File
         get() {
-            if (isUsingDeviceStorage()) {
-                val ext = Environment.getExternalStorageDirectory()
-                if (ext != null && ext.exists() && ext.canRead()) {
-                    return ext
-                }
+            val chromeOsMyFiles = File("/mnt/chromeos/MyFiles")
+            if (chromeOsMyFiles.exists() && chromeOsMyFiles.canRead()) {
+                return chromeOsMyFiles
             }
-            return sandboxMyFilesRoot
+            val ext = Environment.getExternalStorageDirectory()
+            if (ext != null) {
+                return ext
+            }
+            return File("/storage/emulated/0")
         }
 
     val linuxCrostiniRoot: File
-        get() = File(sandboxRootDir, "Linux-Dateien").apply { mkdirs() }
+        get() {
+            val chromeOsLinux = File("/mnt/chromeos/LinuxFiles")
+            if (chromeOsLinux.exists() && chromeOsLinux.canRead()) {
+                return chromeOsLinux
+            }
+            return File(sandboxRootDir, "Linux-Dateien")
+        }
 
     val googleDriveRoot: File
-        get() = File(sandboxRootDir, "Google Drive").apply { mkdirs() }
+        get() {
+            val chromeOsDrive = File("/mnt/chromeos/GoogleDrive")
+            if (chromeOsDrive.exists() && chromeOsDrive.canRead()) {
+                return chromeOsDrive
+            }
+            return File(sandboxRootDir, "Google Drive")
+        }
 
     val trashRoot: File
         get() = File(sandboxRootDir, ".Trash").apply { mkdirs() }
@@ -153,137 +171,130 @@ class VirtualFileSystemRepository @Inject constructor(
         const val VOLUME_DRIVE_OFFLINE = "google_drive_offline"
         const val VOLUME_TRASH = "trash"
 
+        const val UNCONNECTED_LINUX_PATH = "chromeos://linux_unconnected"
+        const val UNCONNECTED_DRIVE_PATH = "chromeos://drive_unconnected"
+
         private const val TRASH_RETENTION_MILLIS = 30L * 24 * 60 * 60 * 1000 // 30 Tage
         private const val PROGRESS_EMIT_INTERVAL_MS = 120L
         private const val PAUSE_POLL_INTERVAL_MS = 150L
     }
 
     /**
-     * Initialisiert die ChromeOS-Verzeichnisstruktur, bereinigt abgelaufene Papierkorb-Einträge
-     * (> 30 Tage) und aktualisiert den Navigationsbaum.
+     * Prüft, ob Google Drive aktuell verbunden ist (über REST API v3, SAF DocumentProvider oder ChromeOS-Mount).
+     */
+    suspend fun isDriveConnected(): Boolean = withContext(Dispatchers.IO) {
+        if (driveManager.isConnected() && driveManager.accountFlow.value != null) return@withContext true
+        val chromeOsDrive = File("/mnt/chromeos/GoogleDrive")
+        if (chromeOsDrive.exists() && chromeOsDrive.canRead()) return@withContext true
+        dao.getAllMountedConnections().any {
+            it.protocol == SafVolumeManager.PROTOCOL_SAF_DRIVE || it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID
+        }
+    }
+
+    /**
+     * Prüft, ob Linux-Dateien (Crostini / Termux) aktuell verbunden sind.
+     */
+    suspend fun isLinuxConnected(): Boolean = withContext(Dispatchers.IO) {
+        val chromeOsLinux = File("/mnt/chromeos/LinuxFiles")
+        if (chromeOsLinux.exists() && chromeOsLinux.canRead()) return@withContext true
+        dao.getAllMountedConnections().any {
+            it.protocol == SafVolumeManager.PROTOCOL_SAF_LINUX || it.volumeId == SafVolumeManager.LINUX_SAF_VOLUME_ID
+        }
+    }
+
+    /**
+     * Initialisiert die ChromeOS-Verzeichnisstruktur, entfernt eventuelle Altlasten aus früheren
+     * Sandbox-Builds, bereinigt abgelaufene Papierkorb-Einträge (> 30 Tage) und aktualisiert den Navigationsbaum.
      */
     suspend fun initialize() = withContext(Dispatchers.IO) {
         sandboxSeeder.ensureSeeded(sandboxRootDir)
+        runCatching {
+            dao.deleteMetadataByPathPrefix(File(sandboxRootDir, "Meine Dateien").absolutePath)
+            dao.deleteMetadataByPathPrefix(File(sandboxRootDir, "Linux-Dateien").absolutePath)
+            dao.deleteMetadataByPathPrefix(File(sandboxRootDir, "Google Drive").absolutePath)
+        }
         purgeExpiredTrashEntries()
         refreshVolumes()
     }
 
     /**
      * Baut den kompletten linken ChromeOS-Navigationsbaum inkl. Speicherplatz-Metriken
-     * und dynamisch eingehängten ZIP/RAR-Archiven, SAF-Ordnern, Google Drive & SMB/SFTP-Freigaben neu auf.
+     * und dynamisch eingehängten ZIP/RAR-Archiven, SAF-Ordnern, Wechselmedien, Google Drive & SMB/SFTP-Freigaben neu auf.
      */
     suspend fun refreshVolumes() = withContext(Dispatchers.IO) {
         val activeMyFilesRoot = myFilesRoot
+        val hasLocalAccess = hasAllFilesAccess()
         val statFs = runCatching { StatFs(activeMyFilesRoot.absolutePath) }.getOrNull()
-        val totalDeviceBytes = statFs?.totalBytes ?: (128L * 1024 * 1024 * 1024)
-        val freeDeviceBytes = statFs?.availableBytes ?: (84L * 1024 * 1024 * 1024)
+        val totalDeviceBytes = statFs?.totalBytes ?: 0L
+        val freeDeviceBytes = statFs?.availableBytes ?: 0L
         val usedDeviceBytes = (totalDeviceBytes - freeDeviceBytes).coerceAtLeast(0L)
-
-        val driveAccount = driveManager.accountFlow.value
-        val driveConnected = driveManager.isConnected() && driveAccount != null
-        val driveTotalBytes = driveAccount?.totalQuotaBytes ?: (15L * 1024 * 1024 * 1024)
-        val driveUsedBytes = if (driveConnected) {
-            driveAccount!!.usedQuotaBytes
-        } else {
-            calculateDirectorySize(googleDriveRoot)
-        }
-
-        val myFilesSubVolumes = activeMyFilesRoot.listFiles()
-            ?.filter { it.isDirectory && !it.name.startsWith(".") }
-            ?.sortedBy { it.name.lowercase() }
-            ?.map { subDir ->
-                VfsVolume(
-                    id = "my_files_${subDir.name.lowercase()}",
-                    title = subDir.name,
-                    type = VfsVolumeType.MY_FILES,
-                    rootPath = subDir.absolutePath,
-                    isExpandable = true
-                )
-            }
-            .orEmpty()
-
-        val driveSubVolumes = if (driveConnected) {
-            listOf(
-                VfsVolume(
-                    id = "drive_my_drive",
-                    title = "Meine Ablage",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = GoogleDriveManager.ROOT_MY_DRIVE,
-                    isExpandable = false
-                ),
-                VfsVolume(
-                    id = "drive_shared_drives",
-                    title = "Geteilte Ablagen",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = GoogleDriveManager.ROOT_SHARED_DRIVES,
-                    isExpandable = false
-                ),
-                VfsVolume(
-                    id = "drive_shared_with_me",
-                    title = "Für mich freigegeben",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = GoogleDriveManager.ROOT_SHARED_WITH_ME
-                ),
-                VfsVolume(
-                    id = "drive_computers",
-                    title = "Computer",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = GoogleDriveManager.ROOT_COMPUTERS,
-                    isExpandable = false
-                ),
-                VfsVolume(
-                    id = VOLUME_DRIVE_OFFLINE,
-                    title = "Offline verfügbar",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = File(googleDriveRoot, "Offline verfügbar").apply { mkdirs() }.absolutePath
-                )
-            )
-        } else {
-            listOf(
-                VfsVolume(
-                    id = "drive_my_drive",
-                    title = "Meine Ablage",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = File(googleDriveRoot, "Meine Ablage").apply { mkdirs() }.absolutePath,
-                    isExpandable = true
-                ),
-                VfsVolume(
-                    id = "drive_shared_drives",
-                    title = "Geteilte Ablagen",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = File(googleDriveRoot, "Geteilte Ablagen").apply { mkdirs() }.absolutePath,
-                    isExpandable = true
-                ),
-                VfsVolume(
-                    id = "drive_shared_with_me",
-                    title = "Für mich freigegeben",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = File(googleDriveRoot, "Für mich freigegeben").apply { mkdirs() }.absolutePath
-                ),
-                VfsVolume(
-                    id = "drive_computers",
-                    title = "Computer",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = File(googleDriveRoot, "Computer").apply { mkdirs() }.absolutePath,
-                    isExpandable = true
-                ),
-                VfsVolume(
-                    id = VOLUME_DRIVE_OFFLINE,
-                    title = "Offline verfügbar",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = File(googleDriveRoot, "Offline verfügbar").apply { mkdirs() }.absolutePath
-                )
-            )
-        }
 
         val allConnections = dao.getAllMountedConnections()
         val linuxSafConn = allConnections.firstOrNull {
             it.protocol == SafVolumeManager.PROTOCOL_SAF_LINUX || it.volumeId == SafVolumeManager.LINUX_SAF_VOLUME_ID
         }
+        val driveSafConn = allConnections.firstOrNull {
+            it.protocol == SafVolumeManager.PROTOCOL_SAF_DRIVE || it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID
+        }
+
+        val driveAccount = driveManager.accountFlow.value
+        val driveApiConnected = driveManager.isConnected() && driveAccount != null
+        val chromeOsDriveRoot = File("/mnt/chromeos/GoogleDrive").takeIf { it.exists() && it.canRead() }
+        val chromeOsLinuxRoot = File("/mnt/chromeos/LinuxFiles").takeIf { it.exists() && it.canRead() }
+
+        val myFilesSubVolumes = if (hasLocalAccess) {
+            activeMyFilesRoot.listFiles()
+                ?.filter { it.isDirectory && !it.name.startsWith(".") }
+                ?.sortedBy { it.name.lowercase() }
+                ?.map { subDir ->
+                    VfsVolume(
+                        id = "my_files_${subDir.name.lowercase()}",
+                        title = subDir.name,
+                        type = VfsVolumeType.MY_FILES,
+                        rootPath = subDir.absolutePath,
+                        isExpandable = true
+                    )
+                }
+                .orEmpty()
+        } else {
+            emptyList()
+        }
+
+        // Echte Wechselmedien (SD-Karten / USB-Sticks) automatisch erkennen
+        val removableVolumes = runCatching {
+            context.getExternalFilesDirs(null)
+                .filterNotNull()
+                .mapNotNull { appExternalDir ->
+                    val rootPath = appExternalDir.absolutePath.substringBefore("/Android/")
+                    val rootFile = File(rootPath)
+                    if (rootPath != activeMyFilesRoot.absolutePath && rootFile.exists() && rootFile.canRead()) {
+                        val remStat = runCatching { StatFs(rootPath) }.getOrNull()
+                        val remTotal = remStat?.totalBytes ?: 0L
+                        val remUsed = (remTotal - (remStat?.availableBytes ?: 0L)).coerceAtLeast(0L)
+                        VfsVolume(
+                            id = "usb_${rootFile.name}",
+                            title = "Wechselmedium (${rootFile.name})",
+                            subtitle = rootPath,
+                            type = VfsVolumeType.REMOVABLE_MEDIA,
+                            rootPath = rootPath,
+                            isExpandable = true,
+                            totalBytes = remTotal,
+                            usedBytes = remUsed
+                        )
+                    } else {
+                        null
+                    }
+                }
+        }.getOrDefault(emptyList())
 
         val mountedArchiveVolumes = archiveManager.getMountedVolumeList()
         val mountedNetworkAndSafVolumes = allConnections
-            .filterNot { it.protocol == SafVolumeManager.PROTOCOL_SAF_LINUX || it.volumeId == SafVolumeManager.LINUX_SAF_VOLUME_ID }
+            .filterNot {
+                it.protocol == SafVolumeManager.PROTOCOL_SAF_LINUX ||
+                    it.volumeId == SafVolumeManager.LINUX_SAF_VOLUME_ID ||
+                    it.protocol == SafVolumeManager.PROTOCOL_SAF_DRIVE ||
+                    it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID
+            }
             .map { conn ->
                 if (conn.protocol == SafVolumeManager.PROTOCOL_SAF || safVolumes.isSafPath(conn.localMountPath)) {
                     safVolumes.toVfsVolume(conn)
@@ -322,45 +333,154 @@ class VirtualFileSystemRepository @Inject constructor(
                 VfsVolume(
                     id = VOLUME_MY_FILES,
                     title = "Meine Dateien",
-                    subtitle = if (isUsingDeviceStorage()) "Gerätespeicher (${activeMyFilesRoot.absolutePath})" else "App-Sandbox",
+                    subtitle = if (hasLocalAccess) {
+                        "Gerätespeicher (${activeMyFilesRoot.absolutePath})"
+                    } else {
+                        "Berechtigung erforderlich – Tippen zum Freigeben"
+                    },
                     type = VfsVolumeType.MY_FILES,
                     rootPath = activeMyFilesRoot.absolutePath,
-                    isExpandable = true,
+                    isExpandable = hasLocalAccess,
                     totalBytes = totalDeviceBytes,
                     usedBytes = usedDeviceBytes,
                     children = myFilesSubVolumes
                 )
             )
-            if (linuxSafConn != null) {
-                add(safVolumes.toVfsVolume(linuxSafConn))
-            } else {
-                add(
+
+            // Linux-Dateien (Crostini / Termux)
+            when {
+                linuxSafConn != null -> add(safVolumes.toVfsVolume(linuxSafConn))
+                chromeOsLinuxRoot != null -> add(
                     VfsVolume(
                         id = VOLUME_LINUX,
                         title = "Linux-Dateien",
-                        subtitle = "Lokale Demo-Ablage (Crostini via SAF einbindbar)",
+                        subtitle = chromeOsLinuxRoot.absolutePath,
                         type = VfsVolumeType.LINUX_CROSTINI,
-                        rootPath = linuxCrostiniRoot.absolutePath,
+                        rootPath = chromeOsLinuxRoot.absolutePath,
                         isExpandable = true,
                         totalBytes = totalDeviceBytes,
-                        usedBytes = calculateDirectorySize(linuxCrostiniRoot)
+                        usedBytes = usedDeviceBytes
+                    )
+                )
+                else -> add(
+                    VfsVolume(
+                        id = VOLUME_LINUX,
+                        title = "Linux-Dateien",
+                        subtitle = "Nicht verbunden – Tippen zum Einbinden",
+                        type = VfsVolumeType.LINUX_CROSTINI,
+                        rootPath = UNCONNECTED_LINUX_PATH,
+                        isExpandable = false
                     )
                 )
             }
-            add(
-                VfsVolume(
-                    id = VOLUME_DRIVE,
-                    title = "Google Drive",
-                    subtitle = if (driveConnected) "Verbunden (${driveAccount!!.email})" else "Lokale Demo-Ablage (kein Konto verbunden)",
-                    type = VfsVolumeType.GOOGLE_DRIVE,
-                    rootPath = if (driveConnected) GoogleDriveManager.ROOT_MY_DRIVE else googleDriveRoot.absolutePath,
-                    isExpandable = true,
-                    isEjectable = driveConnected,
-                    totalBytes = driveTotalBytes,
-                    usedBytes = driveUsedBytes,
-                    children = driveSubVolumes
-                )
-            )
+
+            // Google Drive (REST API v3, SAF DocumentProvider oder ChromeOS-Mount)
+            when {
+                driveApiConnected -> {
+                    val driveTotalBytes = driveAccount!!.totalQuotaBytes.takeIf { it > 0L } ?: (15L * 1024 * 1024 * 1024)
+                    val driveUsedBytes = driveAccount.usedQuotaBytes
+                    val driveSubVolumes = listOf(
+                        VfsVolume(
+                            id = "drive_my_drive",
+                            title = "Meine Ablage",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = GoogleDriveManager.ROOT_MY_DRIVE,
+                            isExpandable = false
+                        ),
+                        VfsVolume(
+                            id = "drive_shared_drives",
+                            title = "Geteilte Ablagen",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = GoogleDriveManager.ROOT_SHARED_DRIVES,
+                            isExpandable = false
+                        ),
+                        VfsVolume(
+                            id = "drive_shared_with_me",
+                            title = "Für mich freigegeben",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = GoogleDriveManager.ROOT_SHARED_WITH_ME
+                        ),
+                        VfsVolume(
+                            id = "drive_computers",
+                            title = "Computer",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = GoogleDriveManager.ROOT_COMPUTERS,
+                            isExpandable = false
+                        ),
+                        VfsVolume(
+                            id = VOLUME_DRIVE_OFFLINE,
+                            title = "Offline verfügbar",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = "chromeos://drive_offline"
+                        )
+                    )
+                    add(
+                        VfsVolume(
+                            id = VOLUME_DRIVE,
+                            title = "Google Drive",
+                            subtitle = "Verbunden (${driveAccount.email})",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = GoogleDriveManager.ROOT_MY_DRIVE,
+                            isExpandable = true,
+                            isEjectable = true,
+                            totalBytes = driveTotalBytes,
+                            usedBytes = driveUsedBytes,
+                            children = driveSubVolumes
+                        )
+                    )
+                }
+                driveSafConn != null -> {
+                    add(safVolumes.toVfsVolume(driveSafConn))
+                }
+                chromeOsDriveRoot != null -> {
+                    val subDirs = chromeOsDriveRoot.listFiles()
+                        ?.filter { it.isDirectory && !it.name.startsWith(".") }
+                        ?.map { sub ->
+                            VfsVolume(
+                                id = "drive_cros_${sub.name.lowercase()}",
+                                title = when (sub.name) {
+                                    "MyDrive" -> "Meine Ablage"
+                                    "SharedWithMe" -> "Für mich freigegeben"
+                                    "Computers" -> "Computer"
+                                    else -> sub.name
+                                },
+                                type = VfsVolumeType.GOOGLE_DRIVE,
+                                rootPath = sub.absolutePath,
+                                isExpandable = true
+                            )
+                        }
+                        .orEmpty()
+                    add(
+                        VfsVolume(
+                            id = VOLUME_DRIVE,
+                            title = "Google Drive",
+                            subtitle = chromeOsDriveRoot.absolutePath,
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = chromeOsDriveRoot.absolutePath,
+                            isExpandable = true,
+                            children = subDirs
+                        )
+                    )
+                }
+                else -> {
+                    add(
+                        VfsVolume(
+                            id = VOLUME_DRIVE,
+                            title = "Google Drive",
+                            subtitle = "Nicht verbunden – Tippen zum Anmelden",
+                            type = VfsVolumeType.GOOGLE_DRIVE,
+                            rootPath = UNCONNECTED_DRIVE_PATH,
+                            isExpandable = false,
+                            isEjectable = false,
+                            totalBytes = 0L,
+                            usedBytes = 0L,
+                            children = emptyList()
+                        )
+                    )
+                }
+            }
+
+            addAll(removableVolumes)
             addAll(mountedArchiveVolumes)
             addAll(mountedNetworkAndSafVolumes)
             add(
@@ -390,6 +510,9 @@ class VirtualFileSystemRepository @Inject constructor(
         showHiddenFiles: Boolean = false,
         recentCategoryFilter: SearchFileTypeFilter = SearchFileTypeFilter.ALL
     ): List<VfsNode> = withContext(Dispatchers.IO) {
+        if (pathOrUri == UNCONNECTED_DRIVE_PATH || pathOrUri == UNCONNECTED_LINUX_PATH) {
+            return@withContext emptyList()
+        }
         val rawNodes: List<VfsNode> = when {
             volumeId == VOLUME_RECENT || pathOrUri == "chromeos://recent" -> {
                 listRecentNodes(showHiddenFiles, recentCategoryFilter)
@@ -397,7 +520,7 @@ class VirtualFileSystemRepository @Inject constructor(
             volumeId == VOLUME_STARRED || pathOrUri == "chromeos://starred" -> {
                 listStarredNodes(showHiddenFiles)
             }
-            volumeId == VOLUME_DRIVE_OFFLINE -> {
+            volumeId == VOLUME_DRIVE_OFFLINE || pathOrUri == "chromeos://drive_offline" -> {
                 listOfflinePinnedNodes(showHiddenFiles)
             }
             volumeId == VOLUME_TRASH || pathOrUri.startsWith(trashRoot.absolutePath) -> {
@@ -416,22 +539,26 @@ class VirtualFileSystemRepository @Inject constructor(
                 driveManager.list(pathOrUri, volumeId, showHiddenFiles)
             }
             else -> {
-                val directory = File(pathOrUri)
-                if (!directory.exists() || !directory.isDirectory) {
+                if (!hasAllFilesAccess() && pathOrUri.startsWith(myFilesRoot.absolutePath)) {
                     emptyList()
                 } else {
-                    val children = directory.listFiles().orEmpty()
-                        .filter { showHiddenFiles || !it.name.startsWith(".") }
-                    val metadataMap = dao.getMetadataForPaths(children.map { it.absolutePath })
-                        .associateBy { it.path }
-                    val isReadOnlyVolume = volumeId.startsWith("archive_")
-                    children.map { file ->
-                        fileToVfsNode(
-                            file = file,
-                            volumeId = volumeId,
-                            metadata = metadataMap[file.absolutePath],
-                            isReadOnly = isReadOnlyVolume
-                        )
+                    val directory = File(pathOrUri)
+                    if (!directory.exists() || !directory.isDirectory) {
+                        emptyList()
+                    } else {
+                        val children = directory.listFiles().orEmpty()
+                            .filter { showHiddenFiles || !it.name.startsWith(".") }
+                        val metadataMap = dao.getMetadataForPaths(children.map { it.absolutePath })
+                            .associateBy { it.path }
+                        val isReadOnlyVolume = volumeId.startsWith("archive_")
+                        children.map { file ->
+                            fileToVfsNode(
+                                file = file,
+                                volumeId = volumeId,
+                                metadata = metadataMap[file.absolutePath],
+                                isReadOnly = isReadOnlyVolume
+                            )
+                        }
                     }
                 }
             }
@@ -549,12 +676,18 @@ class VirtualFileSystemRepository @Inject constructor(
      * (z. B. `Meine Dateien > Projekte > 2026`).
      */
     fun buildBreadcrumbs(currentPath: String, volumeId: String): List<BreadcrumbSegment> {
+        if (currentPath == UNCONNECTED_DRIVE_PATH) {
+            return listOf(BreadcrumbSegment("Google Drive", UNCONNECTED_DRIVE_PATH, VOLUME_DRIVE))
+        }
+        if (currentPath == UNCONNECTED_LINUX_PATH) {
+            return listOf(BreadcrumbSegment("Linux-Dateien", UNCONNECTED_LINUX_PATH, VOLUME_LINUX))
+        }
         when (volumeId) {
             VOLUME_RECENT -> return listOf(BreadcrumbSegment("Zuletzt verwendet", "chromeos://recent", VOLUME_RECENT))
             VOLUME_STARRED -> return listOf(BreadcrumbSegment("Favoriten", "chromeos://starred", VOLUME_STARRED))
             VOLUME_DRIVE_OFFLINE -> return listOf(
-                BreadcrumbSegment("Google Drive", googleDriveRoot.absolutePath, VOLUME_DRIVE),
-                BreadcrumbSegment("Offline verfügbar", File(googleDriveRoot, "Offline verfügbar").absolutePath, VOLUME_DRIVE_OFFLINE)
+                BreadcrumbSegment("Google Drive", GoogleDriveManager.ROOT_MY_DRIVE, VOLUME_DRIVE),
+                BreadcrumbSegment("Offline verfügbar", "chromeos://drive_offline", VOLUME_DRIVE_OFFLINE)
             )
             VOLUME_TRASH -> return listOf(BreadcrumbSegment("Papierkorb", trashRoot.absolutePath, VOLUME_TRASH))
         }
@@ -575,7 +708,11 @@ class VirtualFileSystemRepository @Inject constructor(
 
         if (safVolumes.isSafPath(currentPath)) {
             val title = _volumesFlow.value.firstOrNull { it.id == volumeId }?.title
-                ?: if (volumeId == VOLUME_LINUX) "Linux-Dateien" else "Externer Ordner"
+                ?: when (volumeId) {
+                    VOLUME_LINUX -> "Linux-Dateien"
+                    VOLUME_DRIVE -> "Google Drive"
+                    else -> "Externer Ordner"
+                }
             val rootPath = _volumesFlow.value.firstOrNull { it.id == volumeId }?.rootPath ?: currentPath
             return if (currentPath == rootPath) {
                 listOf(BreadcrumbSegment(title, rootPath, volumeId))
@@ -1164,6 +1301,7 @@ class VirtualFileSystemRepository @Inject constructor(
     suspend fun ejectVolume(volumeId: String): Boolean = withContext(Dispatchers.IO) {
         if (volumeId == VOLUME_DRIVE) {
             driveManager.disconnect()
+            safVolumes.disconnect(VOLUME_DRIVE)
             refreshVolumes()
             return@withContext true
         }
@@ -2209,16 +2347,26 @@ class VirtualFileSystemRepository @Inject constructor(
         showHiddenFiles: Boolean,
         categoryFilter: SearchFileTypeFilter
     ): List<VfsNode> {
-        val allRoots = listOf(
-            VOLUME_MY_FILES to myFilesRoot,
-            VOLUME_LINUX to linuxCrostiniRoot,
-            VOLUME_DRIVE to googleDriveRoot
-        )
+        if (!hasAllFilesAccess()) return emptyList()
+        val allRoots = buildList {
+            add(VOLUME_MY_FILES to myFilesRoot)
+            File("/mnt/chromeos/LinuxFiles").takeIf { it.exists() && it.canRead() }?.let {
+                add(VOLUME_LINUX to it)
+            }
+            File("/mnt/chromeos/GoogleDrive").takeIf { it.exists() && it.canRead() }?.let {
+                add(VOLUME_DRIVE to it)
+            }
+        }
         val recentFiles = mutableListOf<Pair<String, File>>()
         for ((volId, root) in allRoots) {
-            if (!root.exists()) continue
+            if (!root.exists() || !root.canRead()) continue
             root.walkTopDown()
-                .onEnter { showHiddenFiles || !it.name.startsWith(".") }
+                .maxDepth(4)
+                .onEnter { dir ->
+                    (showHiddenFiles || !dir.name.startsWith(".")) &&
+                        !dir.absolutePath.endsWith("/Android/data") &&
+                        !dir.absolutePath.endsWith("/Android/obb")
+                }
                 .filter { it.isFile && (showHiddenFiles || !it.name.startsWith(".")) }
                 .forEach { recentFiles.add(volId to it) }
         }
@@ -2242,17 +2390,13 @@ class VirtualFileSystemRepository @Inject constructor(
 
     private suspend fun listOfflinePinnedNodes(showHiddenFiles: Boolean): List<VfsNode> {
         val pinnedEntities = dao.getOfflinePinnedFiles()
-        val offlineDirFiles = File(googleDriveRoot, "Offline verfügbar")
-            .listFiles()
-            .orEmpty()
-            .filter { showHiddenFiles || !it.name.startsWith(".") }
-
-        val combinedPaths = (pinnedEntities.map { it.path } + offlineDirFiles.map { it.absolutePath }).distinct()
+        val combinedPaths = pinnedEntities.map { it.path }.distinct()
         val metaMap = dao.getMetadataForPaths(combinedPaths).associateBy { it.path }
 
         return combinedPaths.mapNotNull { path ->
             val file = File(path)
             if (!file.exists()) return@mapNotNull null
+            if (!showHiddenFiles && file.name.startsWith(".")) return@mapNotNull null
             val meta = metaMap[path]
             fileToVfsNode(
                 file = file,

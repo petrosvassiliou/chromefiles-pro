@@ -11,12 +11,17 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AccountCircle
 import androidx.compose.material.icons.outlined.CloudSync
+import androidx.compose.material.icons.outlined.FolderShared
 import androidx.compose.material.icons.outlined.OpenInBrowser
 import androidx.compose.material.icons.outlined.Visibility
 import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -42,14 +47,10 @@ import androidx.compose.ui.unit.dp
 import de.chromefiles.app.ui.viewmodel.DriveAuthDialogState
 
 /**
- * Dialog zur echten Google-Drive-REST-API-v3-Anmeldung:
- * - **Modus 1 (OAuth 2.0 PKCE):** Eigene Google-Cloud-OAuth-Client-ID eingeben, im Browser
- *   anmelden (`S256`-Challenge) und den Autorisierungscode bzw. die Redirect-URL einfügen.
- * - **Modus 2 (Direktes Access-Token):** OAuth-2.0-Token (z. B. aus `gcloud auth print-access-token`
- *   oder dem OAuth-Playground) direkt hinterlegen.
- *
- * Ist bereits ein Konto verbunden, zeigt der Dialog Konto-E-Mail, echtes Drive-Kontingent
- * und einen Button zum Trennen.
+ * Dialog zur echten Google-Drive-Anmeldung:
+ * - **1-Klick System-Konto:** Direktes Anmelden mit dem auf dem Android-/ChromeOS-Gerät hinterlegten Google-Konto.
+ * - **1-Klick SAF-Integration:** Einbinden des offiziellen Google-Drive-System-Providers.
+ * - **Erweitert (OAuth 2.0 PKCE / Access-Token):** Eigene Client-ID oder direktes Token.
  */
 @Composable
 fun GoogleDriveAuthDialog(
@@ -58,6 +59,8 @@ fun GoogleDriveAuthDialog(
     onBuildPkceUrl: (String) -> String,
     onConnectWithCode: (clientId: String, codeOrUrl: String) -> Unit,
     onConnectWithToken: (accessToken: String, refreshToken: String, clientId: String) -> Unit,
+    onPickSystemGoogleAccount: () -> Unit = {},
+    onPickGoogleDriveSaf: () -> Unit = {},
     onDisconnect: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -72,7 +75,7 @@ fun GoogleDriveAuthDialog(
     AlertDialog(
         onDismissRequest = { if (!state.isConnecting) onDismiss() },
         icon = { Icon(Icons.Outlined.CloudSync, contentDescription = null) },
-        title = { Text("Google Drive (REST API v3)") },
+        title = { Text("Google Drive verbinden") },
         text = {
             Column(
                 modifier = Modifier.width(460.dp),
@@ -85,12 +88,38 @@ fun GoogleDriveAuthDialog(
                         color = MaterialTheme.colorScheme.primary
                     )
                     Text(
-                        "Google Drive wird direkt über die Google Drive REST API v3 abgefragt. " +
-                            "Beim Trennen wechselt die Seitenleiste zurück zur lokalen Demo-Ablage.",
+                        "Ihr Google Drive ist direkt mit ChromeFiles Pro verbunden.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 } else {
+                    Button(
+                        onClick = {
+                            onDismiss()
+                            onPickSystemGoogleAccount()
+                        },
+                        enabled = !state.isConnecting,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Outlined.AccountCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Google-Konto vom Gerät wählen (1-Klick)")
+                    }
+                    FilledTonalButton(
+                        onClick = {
+                            onDismiss()
+                            onPickGoogleDriveSaf()
+                        },
+                        enabled = !state.isConnecting,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Outlined.FolderShared, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Google Drive über Android-Dateisystem einbinden")
+                    }
+
+                    HorizontalDivider()
+
                     SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
                         SegmentedButton(
                             selected = mode == 0,

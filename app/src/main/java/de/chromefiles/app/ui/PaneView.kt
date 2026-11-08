@@ -1,25 +1,53 @@
 package de.chromefiles.app.ui
 
 import androidx.compose.foundation.border
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.outlined.AccountCircle
+import androidx.compose.material.icons.outlined.CloudSync
+import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.FolderShared
+import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
-import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.UNCONNECTED_DRIVE_PATH
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.UNCONNECTED_LINUX_PATH
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_DRIVE
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_LINUX
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_MY_FILES
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_RECENT
 import de.chromefiles.app.model.VfsNode
 import de.chromefiles.app.ui.components.ChromeOsTopBar
 import de.chromefiles.app.ui.components.EmptyFolderState
@@ -54,6 +82,8 @@ fun PaneView(
     onRequestKeyboardFocus: () -> Unit,
     onRequestAllFilesAccess: () -> Unit = {},
     onPickSafFolder: (asLinuxContainer: Boolean) -> Unit = {},
+    onPickGoogleDriveSaf: () -> Unit = {},
+    onPickSystemGoogleAccount: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val pane by controller.state.collectAsStateWithLifecycle()
@@ -123,6 +153,13 @@ fun PaneView(
             onBackgroundContextMenu = { viewModel.showContextMenu(paneId, null) }
         )
 
+    val needsLocalPermissionPrompt = !ui.hasAllFilesAccess &&
+        (pane.currentVolumeId == VOLUME_MY_FILES || pane.currentVolumeId == VOLUME_RECENT)
+    val needsDriveConnectPrompt = pane.currentVolumeId == VOLUME_DRIVE &&
+        (!ui.isDriveConnected || pane.currentPath == UNCONNECTED_DRIVE_PATH)
+    val needsLinuxConnectPrompt = pane.currentVolumeId == VOLUME_LINUX &&
+        pane.currentPath == UNCONNECTED_LINUX_PATH
+
     Surface(
         modifier = modifier
             .border(
@@ -152,7 +189,7 @@ fun PaneView(
                 sortSpec = pane.sortSpec,
                 showHiddenFiles = ui.showHiddenFiles,
                 isDetailsPanelVisible = ui.isDetailsPanelVisible,
-                canCreateFolder = pane.isWritableLocation,
+                canCreateFolder = pane.isWritableLocation && !needsLocalPermissionPrompt && !needsDriveConnectPrompt && !needsLinuxConnectPrompt,
                 isTrash = pane.isTrash,
                 hasSelection = pane.selectedIds.isNotEmpty(),
                 onToggleSidebar = viewModel::toggleSidebar,
@@ -202,6 +239,24 @@ fun PaneView(
 
             Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
                 when {
+                    needsLocalPermissionPrompt -> Box(modifier = Modifier.fillMaxSize()) {
+                        StoragePermissionOnboardingCard(
+                            onGrantAllFilesAccess = onRequestAllFilesAccess,
+                            onPickSafFolder = { onPickSafFolder(false) }
+                        )
+                    }
+                    needsDriveConnectPrompt -> Box(modifier = Modifier.fillMaxSize()) {
+                        GoogleDriveOnboardingCard(
+                            onPickSystemGoogleAccount = onPickSystemGoogleAccount,
+                            onPickGoogleDriveSaf = onPickGoogleDriveSaf,
+                            onOpenDriveAuthDialog = viewModel::showDriveAuthDialog
+                        )
+                    }
+                    needsLinuxConnectPrompt -> Box(modifier = Modifier.fillMaxSize()) {
+                        LinuxOnboardingCard(
+                            onPickLinuxSafFolder = { onPickSafFolder(true) }
+                        )
+                    }
                     pane.nodes.isEmpty() -> Box(modifier = containerModifier.fillMaxSize()) {
                         EmptyFolderState(isSearch = pane.isShowingSearchResults, isLoading = pane.isLoading)
                     }
@@ -232,3 +287,163 @@ fun PaneView(
         }
     }
 }
+
+@Composable
+private fun StoragePermissionOnboardingCard(
+    onGrantAllFilesAccess: () -> Unit,
+    onPickSafFolder: () -> Unit
+) {
+    Box(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.widthIn(max = 460.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.LockOpen,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(56.dp)
+            )
+            Text(
+                text = "Lokalen Gerätespeicher freigeben",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Damit ChromeFiles Pro Ihre echten lokalen Ordner und Dateien (/storage/emulated/0 – Download, DCIM, Documents, Pictures, Music usw.) anzeigen und verwalten kann, aktivieren Sie bitte die Android-Berechtigung „Zugriff auf alle Dateien“.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(4.dp))
+            Button(
+                onClick = onGrantAllFilesAccess,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Outlined.LockOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Zugriff auf alle Dateien jetzt aktivieren")
+            }
+            OutlinedButton(
+                onClick = onPickSafFolder,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Outlined.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Einzelnen Ordner über System-Picker öffnen")
+            }
+        }
+    }
+}
+
+@Composable
+private fun GoogleDriveOnboardingCard(
+    onPickSystemGoogleAccount: () -> Unit,
+    onPickGoogleDriveSaf: () -> Unit,
+    onOpenDriveAuthDialog: () -> Unit
+) {
+    Box(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.widthIn(max = 460.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.CloudSync,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(56.dp)
+            )
+            Text(
+                text = "Mit Ihrem Google Drive verbinden",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Verbinden Sie Ihr Google-Konto, um direkt auf Ihre echte „Meine Ablage“, „Geteilte Ablagen“ und „Für mich freigegeben“-Dateien zuzugreifen.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(4.dp))
+            Button(
+                onClick = onPickSystemGoogleAccount,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Outlined.AccountCircle, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Google-Konto vom Gerät wählen (1-Klick)")
+            }
+            FilledTonalButton(
+                onClick = onPickGoogleDriveSaf,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Outlined.FolderShared, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Google Drive über Android-Dateisystem einbinden")
+            }
+            OutlinedButton(
+                onClick = onOpenDriveAuthDialog,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Outlined.CloudSync, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Mit OAuth 2.0 / Browser-Token anmelden")
+            }
+        }
+    }
+}
+
+@Composable
+private fun LinuxOnboardingCard(
+    onPickLinuxSafFolder: () -> Unit
+) {
+    Box(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier.widthIn(max = 460.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.Terminal,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.primary,
+                modifier = Modifier.size(56.dp)
+            )
+            Text(
+                text = "Linux-Dateien (Crostini / Termux) einbinden",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.SemiBold,
+                textAlign = TextAlign.Center
+            )
+            Text(
+                text = "Wählen Sie Ihren ChromeOS Linux-Container („Linux-Dateien“) oder Ihr Termux-Verzeichnis im System-Auswahldialog aus, um es dauerhaft einzubinden.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(Modifier.height(4.dp))
+            Button(
+                onClick = onPickLinuxSafFolder,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Icon(Icons.Outlined.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text("Linux-Ordner jetzt auswählen")
+            }
+        }
+    }
+}
+

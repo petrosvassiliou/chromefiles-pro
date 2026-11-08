@@ -250,13 +250,10 @@ private fun StorageIndicator(volumes: List<VfsVolume>, isDriveConnected: Boolean
     ) {
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         Spacer(Modifier.height(12.dp))
-        myFiles?.let { StorageBar(label = "Googlebook-Speicher", volume = it) }
-        drive?.let {
+        myFiles?.let { StorageBar(label = "Gerätespeicher", volume = it) }
+        if (isDriveConnected && drive != null) {
             Spacer(Modifier.height(12.dp))
-            StorageBar(
-                label = if (isDriveConnected) "Google Drive" else "Google Drive (Demo-Kontingent)",
-                volume = it
-            )
+            StorageBar(label = "Google Drive", volume = drive)
         }
     }
 }

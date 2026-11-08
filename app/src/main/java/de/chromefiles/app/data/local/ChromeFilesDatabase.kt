@@ -143,6 +143,9 @@ interface ChromeFilesDao {
     @Query("DELETE FROM file_metadata WHERE path = :path")
     suspend fun deleteMetadataByPath(path: String)
 
+    @Query("DELETE FROM file_metadata WHERE path LIKE :pathPrefix || '%'")
+    suspend fun deleteMetadataByPathPrefix(pathPrefix: String)
+
     /**
      * Echtzeit-Volltextsuche über SQLite FTS4/FTS5 inkl. Fallback auf Teilstring-Suche.
      */
