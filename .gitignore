@@ -1,0 +1,21 @@
+# Gradle & Build Artifacts
+.gradle/
+build/
+app/build/
+local.properties
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+.cxx/
+captures/
+.externalNativeBuild/
+
+# Keystore (excluded from public repo; release APKs are attached to GitHub Releases)
+app/keystore/
+
+# OS & Temp files
+.DS_Store
+Thumbs.db
+*~
+*.swp

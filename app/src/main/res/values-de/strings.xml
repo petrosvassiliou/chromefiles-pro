@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Dateien</string>
+    <string name="app_full_name">ChromeFiles Pro</string>
+    <string name="nav_recent">Zuletzt verwendet</string>
+    <string name="nav_starred">Favoriten</string>
+    <string name="nav_my_files">Meine Dateien</string>
+    <string name="nav_downloads">Downloads</string>
+    <string name="nav_play_files">Play-Dateien</string>
+    <string name="nav_camera">Kamera</string>
+    <string name="nav_linux_files">Linux-Dateien</string>
+    <string name="nav_google_drive">Google Drive</string>
+    <string name="nav_drive_my_drive">Meine Ablage</string>
+    <string name="nav_drive_shared_drives">Geteilte Ablagen</string>
+    <string name="nav_drive_shared_with_me">Für mich freigegeben</string>
+    <string name="nav_drive_computers">Computer</string>
+    <string name="nav_drive_offline">Offline verfügbar</string>
+    <string name="nav_mounted_archives">Eingehängte Archive &amp; Medien</string>
+    <string name="nav_trash">Papierkorb</string>
+    <string name="action_eject">Auswerfen</string>
+    <string name="action_new_folder">Neuer Ordner</string>
+    <string name="action_show_hidden_files">Versteckte Dateien anzeigen</string>
+    <string name="action_toggle_details">Datei-Info ein-/ausblenden</string>
+    <string name="action_empty_trash">Papierkorb leeren</string>
+    <string name="action_restore_from_trash">Wiederherstellen</string>
+</resources>
