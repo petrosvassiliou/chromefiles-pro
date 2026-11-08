@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Deep ChromeOS / Google Blue Gradient Background -->
+    <path android:pathData="M0,0h108v108h-108z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="0"
+                android:startY="0"
+                android:endX="108"
+                android:endY="108"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FF0B57D0" />
+                <item android:offset="0.55" android:color="#FF1A73E8" />
+                <item android:offset="1.0" android:color="#FF0842A0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Subtle Soft Glow Accent -->
+    <path
+        android:fillColor="#1FFFFFFF"
+        android:pathData="M0,0 L108,0 L108,46 C78,60 36,54 0,38 Z" />
+</vector>

@@ -10,6 +10,7 @@ import androidx.compose.foundation.gestures.scrollBy
 import androidx.compose.foundation.gestures.waitForUpOrCancellation
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -41,11 +42,14 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.FolderOpen
+import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.OfflinePin
 import androidx.compose.material.icons.outlined.SearchOff
+import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -229,6 +233,13 @@ fun Modifier.fileAreaPointerHandling(
                 if (down.type == PointerType.Mouse) {
                     if (pressEvent.buttons.isSecondaryPressed) {
                         down.consume()
+                        while (true) {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            event.changes.forEach { it.consume() }
+                            if (!event.buttons.isSecondaryPressed && event.changes.none { it.pressed }) {
+                                break
+                            }
+                        }
                         currentOnBackgroundMenu()
                         return@awaitEachGesture
                     }
@@ -284,9 +295,10 @@ fun Modifier.fileAreaPointerHandling(
 
 /** Callbacks pro Element – gemeinsam für Listen- und Rasteransicht. */
 class FileItemCallbacks(
-    val onClick: (VfsNode, ctrl: Boolean, shift: Boolean) -> Unit,
+    val onClick: (VfsNode, ctrl: Boolean, shift: Boolean, isTouch: Boolean) -> Unit,
     val onOpen: (VfsNode) -> Unit,
     val onContextMenu: (VfsNode) -> Unit,
+    val onToggleStarred: (VfsNode) -> Unit = {},
     val onPrepareDrag: (VfsNode) -> DragAndDropTransferData?,
     val canDropOnFolder: (VfsNode) -> Boolean,
     val onDropOnFolder: (VfsNode, DropPayload) -> Boolean,
@@ -310,7 +322,7 @@ private fun Modifier.fileItem(
     .fileItemGestures(
         key = node.id,
         enabled = !isRenaming,
-        onClick = { ctrl, shift -> callbacks.onClick(node, ctrl, shift) },
+        onClick = { ctrl, shift, isTouch -> callbacks.onClick(node, ctrl, shift, isTouch) },
         onDoubleClick = { callbacks.onOpen(node) },
         onContextMenu = { callbacks.onContextMenu(node) },
         onPrepareDrag = { callbacks.onPrepareDrag(node) },
@@ -351,38 +363,48 @@ fun FileListView(
         }
     }
 
-    Column(modifier = modifier.fillMaxSize()) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(36.dp)
-                .padding(horizontal = 12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            HeaderCell(SortColumn.NAME, sortSpec, onSortColumn, Modifier.weight(1f))
-            PaneResizeHandle(onDragDp = { onResizeColumn(SortColumn.SIZE, it) })
-            HeaderCell(SortColumn.SIZE, sortSpec, onSortColumn, Modifier.width(columnWidths.size.dp))
-            PaneResizeHandle(onDragDp = { onResizeColumn(SortColumn.TYPE, it) })
-            HeaderCell(SortColumn.TYPE, sortSpec, onSortColumn, Modifier.width(columnWidths.type.dp))
-            PaneResizeHandle(onDragDp = { onResizeColumn(SortColumn.DATE_MODIFIED, it) })
-            HeaderCell(SortColumn.DATE_MODIFIED, sortSpec, onSortColumn, Modifier.width(columnWidths.date.dp))
-        }
-        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
-        Box(modifier = containerModifier.fillMaxSize()) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.fillMaxSize(),
-                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+    BoxWithConstraints(modifier = modifier.fillMaxSize()) {
+        val isCompactList = maxWidth < 640.dp
+        Column(modifier = Modifier.fillMaxSize()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(36.dp)
+                    .padding(horizontal = 12.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                items(nodes, key = { it.id }) { node ->
-                    FileListRow(
-                        node = node,
-                        isSelected = node.id in selectedIds,
-                        isRenaming = node.id == renamingId,
-                        columnWidths = columnWidths,
-                        areaState = areaState,
-                        callbacks = callbacks
-                    )
+                HeaderCell(SortColumn.NAME, sortSpec, onSortColumn, Modifier.weight(1f))
+                if (!isCompactList) {
+                    PaneResizeHandle(onDragDp = { onResizeColumn(SortColumn.SIZE, it) })
+                    HeaderCell(SortColumn.SIZE, sortSpec, onSortColumn, Modifier.width(columnWidths.size.dp))
+                    PaneResizeHandle(onDragDp = { onResizeColumn(SortColumn.TYPE, it) })
+                    HeaderCell(SortColumn.TYPE, sortSpec, onSortColumn, Modifier.width(columnWidths.type.dp))
+                    PaneResizeHandle(onDragDp = { onResizeColumn(SortColumn.DATE_MODIFIED, it) })
+                    HeaderCell(SortColumn.DATE_MODIFIED, sortSpec, onSortColumn, Modifier.width(columnWidths.date.dp))
+                    Spacer(Modifier.width(72.dp))
+                } else {
+                    HeaderCell(SortColumn.DATE_MODIFIED, sortSpec, onSortColumn, Modifier.width(120.dp))
+                    Spacer(Modifier.width(68.dp))
+                }
+            }
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+            Box(modifier = containerModifier.fillMaxSize()) {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                ) {
+                    items(nodes, key = { it.id }) { node ->
+                        FileListRow(
+                            node = node,
+                            isSelected = node.id in selectedIds,
+                            isRenaming = node.id == renamingId,
+                            isCompact = isCompactList,
+                            columnWidths = columnWidths,
+                            areaState = areaState,
+                            callbacks = callbacks
+                        )
+                    }
                 }
             }
         }
@@ -429,6 +451,7 @@ private fun FileListRow(
     node: VfsNode,
     isSelected: Boolean,
     isRenaming: Boolean,
+    isCompact: Boolean,
     columnWidths: ColumnWidths,
     areaState: FileAreaState,
     callbacks: FileItemCallbacks
@@ -438,24 +461,51 @@ private fun FileListRow(
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .height(40.dp)
+            .height(if (isCompact) 52.dp else 42.dp)
             .fileItem(node, isRenaming, callbacks, areaState, shape)
             .background(if (isSelected) colors.primaryContainer else Color.Transparent)
-            .padding(horizontal = 12.dp),
+            .padding(start = 12.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-            Icon(node.icon(), contentDescription = null, tint = node.iconTint(), modifier = Modifier.size(20.dp))
-            Spacer(Modifier.width(12.dp))
-            if (isRenaming) {
-                InlineRenameField(
-                    node = node,
-                    textStyle = MaterialTheme.typography.bodyMedium,
-                    onCommit = { callbacks.onRenameCommit(node, it) },
-                    onCancel = callbacks.onRenameCancel,
-                    modifier = Modifier.weight(1f)
+        Icon(node.icon(), contentDescription = null, tint = node.iconTint(), modifier = Modifier.size(22.dp))
+        Spacer(Modifier.width(12.dp))
+        if (isRenaming) {
+            InlineRenameField(
+                node = node,
+                textStyle = MaterialTheme.typography.bodyMedium,
+                onCommit = { callbacks.onRenameCommit(node, it) },
+                onCancel = callbacks.onRenameCancel,
+                modifier = Modifier.weight(1f)
+            )
+        } else if (isCompact) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = node.name,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = if (node.isDirectory) FontWeight.Medium else FontWeight.Normal,
+                        color = if (node.isHidden) colors.onSurfaceVariant else colors.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false)
+                    )
+                    NodeBadges(node)
+                }
+                val subtitle = if (node.isDirectory) {
+                    "${node.germanTypeLabel} • ${ChromeFormat.date(node.lastModifiedMillis)}"
+                } else {
+                    "${ChromeFormat.bytes(node.sizeBytes)} • ${ChromeFormat.date(node.lastModifiedMillis)}"
+                }
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = colors.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
                 )
-            } else {
+            }
+        } else {
+            Row(modifier = Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = node.name,
                     style = MaterialTheme.typography.bodyMedium,
@@ -466,13 +516,35 @@ private fun FileListRow(
                 )
                 NodeBadges(node)
             }
+            Spacer(Modifier.width(6.dp))
+            CellText(if (node.isDirectory) "—" else ChromeFormat.bytes(node.sizeBytes), columnWidths.size.dp)
+            Spacer(Modifier.width(6.dp))
+            CellText(node.germanTypeLabel, columnWidths.type.dp)
+            Spacer(Modifier.width(6.dp))
+            CellText(ChromeFormat.date(node.lastModifiedMillis), columnWidths.date.dp)
         }
-        Spacer(Modifier.width(6.dp))
-        CellText(if (node.isDirectory) "—" else ChromeFormat.bytes(node.sizeBytes), columnWidths.size.dp)
-        Spacer(Modifier.width(6.dp))
-        CellText(node.germanTypeLabel, columnWidths.type.dp)
-        Spacer(Modifier.width(6.dp))
-        CellText(ChromeFormat.date(node.lastModifiedMillis), columnWidths.date.dp)
+        IconButton(
+            onClick = { callbacks.onToggleStarred(node) },
+            modifier = Modifier.size(34.dp)
+        ) {
+            Icon(
+                imageVector = if (node.isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
+                contentDescription = if (node.isStarred) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen",
+                tint = if (node.isStarred) Color(0xFFF9AB00) else colors.onSurfaceVariant,
+                modifier = Modifier.size(18.dp)
+            )
+        }
+        IconButton(
+            onClick = { callbacks.onContextMenu(node) },
+            modifier = Modifier.size(34.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.MoreVert,
+                contentDescription = "Kontextmenü öffnen",
+                tint = colors.onSurfaceVariant,
+                modifier = Modifier.size(18.dp)
+            )
+        }
     }
 }
 
@@ -683,11 +755,11 @@ private fun FolderTile(
             .height(48.dp)
             .fileItem(node, isRenaming, callbacks, areaState, shape)
             .background(if (isSelected) colors.primaryContainer else colors.surfaceContainerHigh)
-            .padding(horizontal = 14.dp),
+            .padding(start = 14.dp, end = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(node.icon(), contentDescription = null, tint = node.iconTint(), modifier = Modifier.size(20.dp))
-        Spacer(Modifier.width(12.dp))
+        Spacer(Modifier.width(10.dp))
         if (isRenaming) {
             InlineRenameField(
                 node = node,
@@ -706,6 +778,28 @@ private fun FolderTile(
                 modifier = Modifier.weight(1f)
             )
             NodeBadges(node)
+        }
+        IconButton(
+            onClick = { callbacks.onToggleStarred(node) },
+            modifier = Modifier.size(30.dp)
+        ) {
+            Icon(
+                imageVector = if (node.isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
+                contentDescription = if (node.isStarred) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen",
+                tint = if (node.isStarred) Color(0xFFF9AB00) else colors.onSurfaceVariant,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+        IconButton(
+            onClick = { callbacks.onContextMenu(node) },
+            modifier = Modifier.size(30.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Outlined.MoreVert,
+                contentDescription = "Kontextmenü öffnen",
+                tint = colors.onSurfaceVariant,
+                modifier = Modifier.size(16.dp)
+            )
         }
     }
 }
@@ -727,13 +821,46 @@ private fun FileTile(
             .background(if (isSelected) colors.primaryContainer else colors.surfaceContainerHigh)
             .padding(8.dp)
     ) {
-        FileThumbnail(
-            node = node,
-            modifier = Modifier
-                .fillMaxWidth()
-                .aspectRatio(4f / 3f)
-                .clip(RoundedCornerShape(8.dp))
-        )
+        Box {
+            FileThumbnail(
+                node = node,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(4f / 3f)
+                    .clip(RoundedCornerShape(8.dp))
+            )
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(4.dp)
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(colors.surface.copy(alpha = 0.82f)),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = { callbacks.onToggleStarred(node) },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = if (node.isStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
+                        contentDescription = if (node.isStarred) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen",
+                        tint = if (node.isStarred) Color(0xFFF9AB00) else colors.onSurfaceVariant,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+                IconButton(
+                    onClick = { callbacks.onContextMenu(node) },
+                    modifier = Modifier.size(28.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Outlined.MoreVert,
+                        contentDescription = "Kontextmenü öffnen",
+                        tint = colors.onSurfaceVariant,
+                        modifier = Modifier.size(15.dp)
+                    )
+                }
+            }
+        }
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(node.icon(), contentDescription = null, tint = node.iconTint(), modifier = Modifier.size(16.dp))
@@ -773,7 +900,7 @@ fun FileThumbnail(node: VfsNode, modifier: Modifier = Modifier, renderWidth: Dp 
     ) {
         Icon(node.icon(), contentDescription = null, tint = node.iconTint(), modifier = Modifier.size(48.dp))
         when {
-            node.isRemote -> Unit
+            node.isRemote || node.isSaf || node.isGoogleDriveApi -> Unit
             node.isImage || node.isVideo -> {
                 AsyncImage(
                     model = ImageRequest.Builder(LocalPlatformContext.current)
@@ -813,25 +940,47 @@ fun FileThumbnail(node: VfsNode, modifier: Modifier = Modifier, renderWidth: Dp 
 }
 
 @Composable
-fun EmptyFolderState(isSearch: Boolean, isLoading: Boolean, modifier: Modifier = Modifier) {
-    Box(modifier = modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+fun EmptyFolderState(
+    isSearch: Boolean,
+    isLoading: Boolean,
+    isStarred: Boolean = false,
+    modifier: Modifier = Modifier
+) {
+    Box(modifier = modifier.fillMaxSize().padding(24.dp), contentAlignment = Alignment.Center) {
         if (isLoading) {
             CircularProgressIndicator()
         } else {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
                 Icon(
-                    imageVector = if (isSearch) Icons.Outlined.SearchOff else Icons.Outlined.FolderOpen,
+                    imageVector = when {
+                        isSearch -> Icons.Outlined.SearchOff
+                        isStarred -> Icons.Outlined.StarOutline
+                        else -> Icons.Outlined.FolderOpen
+                    },
                     contentDescription = null,
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(64.dp)
                 )
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    text = if (isSearch) "Keine passenden Ergebnisse" else "Dieser Ordner ist leer",
+                    text = when {
+                        isSearch -> "Keine passenden Ergebnisse"
+                        isStarred -> "Noch keine Favoriten vorhanden"
+                        else -> "Dieser Ordner ist leer"
+                    },
                     style = MaterialTheme.typography.titleMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     textAlign = TextAlign.Center
                 )
+                if (isStarred) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = "Tippe bei einem Ordner oder einer Datei auf das Stern-Symbol (☆), öffne das Kontextmenü (⋮ / Rechtsklick / langes Drücken) oder ziehe einen Ordner per Drag & Drop auf „Favoriten“.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center
+                    )
+                }
             }
         }
     }

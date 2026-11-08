@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Dateien</string>
-    <string name="app_full_name">ChromeFiles Pro</string>
+    <string name="app_name">Files Pro</string>
+    <string name="app_full_name">Files Pro</string>
     <string name="nav_recent">Zuletzt verwendet</string>
     <string name="nav_starred">Favoriten</string>
     <string name="nav_my_files">Meine Dateien</string>

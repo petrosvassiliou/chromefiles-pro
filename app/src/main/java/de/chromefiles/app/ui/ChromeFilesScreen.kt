@@ -37,7 +37,10 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.height
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -53,6 +56,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -74,7 +78,9 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.input.ImeAction
@@ -86,6 +92,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import de.chromefiles.app.data.archive.ArchiveFormat
 import de.chromefiles.app.model.FileOperationStatus
 import de.chromefiles.app.model.VfsNode
 import de.chromefiles.app.model.VfsVolumeType
@@ -101,6 +108,7 @@ import de.chromefiles.app.ui.components.OperationsCenter
 import de.chromefiles.app.ui.components.PaneResizeHandle
 import de.chromefiles.app.ui.components.TabInfo
 import de.chromefiles.app.ui.components.TabStrip
+import de.chromefiles.app.ui.dnd.findActivity
 import de.chromefiles.app.ui.dnd.handleDrop
 import de.chromefiles.app.ui.quickview.QuickViewOverlay
 import de.chromefiles.app.ui.viewmodel.ChromeFilesViewModel
@@ -152,8 +160,8 @@ fun ChromeFilesScreen(
         }
     }
 
-    var pendingSafAsLinux by remember { mutableStateOf(false) }
-    var pendingSafAsGoogleDrive by remember { mutableStateOf(false) }
+    var pendingSafAsLinux by rememberSaveable { mutableStateOf(false) }
+    var pendingSafAsGoogleDrive by rememberSaveable { mutableStateOf(false) }
     val safTreeLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenDocumentTree()
     ) { treeUri ->
@@ -207,8 +215,15 @@ fun ChromeFilesScreen(
                 context = context,
                 account = acct,
                 onToken = viewModel::connectDriveWithSystemAccountToken,
-                onConsentIntent = null
+                onConsentIntent = null,
+                onFallbackToSaf = {
+                    viewModel.postUserMessage("Bitte Google-Drive-Ordner wählen und unten auf „Diesen Ordner verwenden“ tippen.")
+                    launchGoogleDriveSafPicker()
+                }
             )
+        } else {
+            viewModel.postUserMessage("Bitte Google-Drive-Ordner wählen und unten auf „Diesen Ordner verwenden“ tippen.")
+            launchGoogleDriveSafPicker()
         }
     }
     val googleAccountPickerLauncher = rememberLauncherForActivityResult(
@@ -225,9 +240,17 @@ fun ChromeFilesScreen(
                 account = account,
                 onToken = viewModel::connectDriveWithSystemAccountToken,
                 onConsentIntent = { consentIntent ->
-                    runCatching { googleConsentLauncher.launch(consentIntent) }
+                    runCatching { googleConsentLauncher.launch(consentIntent) }.onFailure {
+                        launchGoogleDriveSafPicker()
+                    }
+                },
+                onFallbackToSaf = {
+                    viewModel.postUserMessage("Google Drive wird über den Android-Dateimanager geöffnet – bitte „Diesen Ordner verwenden“ antippen.")
+                    launchGoogleDriveSafPicker()
                 }
             )
+        } else if (result.resultCode != Activity.RESULT_CANCELED) {
+            launchGoogleDriveSafPicker()
         }
     }
     fun launchSystemGoogleAccountPicker() {
@@ -241,7 +264,7 @@ fun ChromeFilesScreen(
             null
         )
         runCatching { googleAccountPickerLauncher.launch(intent) }.onFailure {
-            viewModel.showDriveAuthDialog()
+            launchGoogleDriveSafPicker()
         }
     }
 
@@ -263,6 +286,7 @@ fun ChromeFilesScreen(
     val textInputOrOverlayActive = focusedPane?.isSearchOpen == true ||
         focusedPane?.renamingId != null ||
         ui.newFolderPaneId != null ||
+        ui.compressDialog != null ||
         ui.pendingPermanentDelete != null ||
         ui.pendingArchivePasswordNode != null ||
         ui.pendingBatchRenameNodes != null ||
@@ -627,12 +651,19 @@ fun ChromeFilesScreen(
             }
         }
 
-        // Kontextmenü an der letzten Zeigerposition (Rechtsklick / Zwei-Finger-Tipp / langes Drücken).
+        // Kontextmenü an der letzten Zeigerposition (Rechtsklick / Zwei-Finger-Tipp / langes Drücken / ⋮-Button).
         val menu = ui.contextMenu
         val menuPane = menu?.let { viewModel.pane(it.paneId)?.current }
+        val menuOpenedAtMillis = remember(menu) { System.currentTimeMillis() }
+        val configuration = LocalConfiguration.current
+        val density = LocalDensity.current
+        val screenWidthPx = with(density) { configuration.screenWidthDp.dp.roundToPx() }
+        val screenHeightPx = with(density) { configuration.screenHeightDp.dp.roundToPx() }
+        val clampedMenuX = lastPressPosition.x.roundToInt().coerceIn(16, (screenWidthPx - 240).coerceAtLeast(16))
+        val clampedMenuY = lastPressPosition.y.roundToInt().coerceIn(48, (screenHeightPx - 320).coerceAtLeast(48))
         Box(
             modifier = Modifier
-                .offset { IntOffset(lastPressPosition.x.roundToInt(), lastPressPosition.y.roundToInt()) }
+                .offset { IntOffset(clampedMenuX, clampedMenuY) }
                 .size(1.dp)
         ) {
             if (menu != null && menuPane != null) {
@@ -643,7 +674,11 @@ fun ChromeFilesScreen(
                     viewModel = viewModel,
                     showHiddenFiles = ui.showHiddenFiles,
                     hasClipboard = ui.clipboard != null,
-                    onDismiss = viewModel::dismissContextMenu
+                    onDismiss = {
+                        if (System.currentTimeMillis() - menuOpenedAtMillis > 350L) {
+                            viewModel.dismissContextMenu()
+                        }
+                    }
                 )
             }
         }
@@ -696,6 +731,13 @@ fun ChromeFilesScreen(
             onDismiss = viewModel::dismissDriveAuthDialog
         )
     }
+    ui.compressDialog?.let { compressState ->
+        CompressArchiveDialog(
+            nodes = compressState.nodes,
+            onConfirm = viewModel::confirmCompress,
+            onDismiss = viewModel::dismissCompressDialog
+        )
+    }
     ui.pendingBatchRenameNodes?.let { (_, nodes) ->
         BatchRenameDialog(
             nodes = nodes,
@@ -703,10 +745,11 @@ fun ChromeFilesScreen(
             onDismiss = viewModel::dismissBatchRename
         )
     }
-    ui.pendingArchivePasswordNode?.let { (paneId, archiveNode) ->
+    ui.pendingArchivePasswordNode?.let { (_, archiveNode) ->
         ArchivePasswordDialog(
             archiveName = archiveNode.name,
-            onConfirm = { password -> viewModel.mountArchive(paneId, archiveNode, password) },
+            isExtractToFolder = ui.pendingArchiveExtractToFolder,
+            onConfirm = viewModel::submitArchivePassword,
             onDismiss = viewModel::dismissArchivePasswordDialog
         )
     }
@@ -734,8 +777,95 @@ fun ChromeFilesScreen(
 }
 
 @Composable
+private fun CompressArchiveDialog(
+    nodes: List<VfsNode>,
+    onConfirm: (archiveName: String, format: ArchiveFormat, password: String?) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val defaultBaseName = if (nodes.size == 1) {
+        val single = nodes.first()
+        if (single.isDirectory) single.name else single.name.substringBeforeLast('.').ifBlank { single.name }
+    } else {
+        "Archiv"
+    }
+    var name by remember { mutableStateOf(defaultBaseName) }
+    var selectedFormat by remember { mutableStateOf(ArchiveFormat.ZIP) }
+    var password by remember { mutableStateOf("") }
+    val supportsPassword = selectedFormat != ArchiveFormat.TAR_GZ
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Elemente komprimieren") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = if (nodes.size == 1) "„${nodes.first().name}“ in ein Archiv packen:"
+                    else "${nodes.size} ausgewählte Elemente in ein Archiv packen:",
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    singleLine = true,
+                    label = { Text("Archivname (ohne Endung)") },
+                    suffix = { Text(".${selectedFormat.extension}") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Text(
+                    text = "Format wählen:",
+                    style = MaterialTheme.typography.labelLarge
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    listOf(
+                        ArchiveFormat.ZIP to ".zip",
+                        ArchiveFormat.RAR to ".rar",
+                        ArchiveFormat.SEVEN_Z to ".7z",
+                        ArchiveFormat.TAR_GZ to ".tar.gz"
+                    ).forEach { (fmt, label) ->
+                        FilterChip(
+                            selected = selectedFormat == fmt,
+                            onClick = { selectedFormat = fmt },
+                            label = { Text(label) }
+                        )
+                    }
+                }
+                if (supportsPassword) {
+                    OutlinedTextField(
+                        value = password,
+                        onValueChange = { password = it },
+                        singleLine = true,
+                        label = { Text("Passwortschutz (optional, AES-256)") },
+                        visualTransformation = androidx.compose.ui.text.input.PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(
+                            keyboardType = androidx.compose.ui.text.input.KeyboardType.Password,
+                            imeAction = ImeAction.Done
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onConfirm(name.trim(), selectedFormat, password.takeIf { supportsPassword && it.isNotBlank() }) },
+                enabled = name.isNotBlank()
+            ) {
+                Text("Komprimieren")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Abbrechen") }
+        }
+    )
+}
+
+@Composable
 private fun ArchivePasswordDialog(
     archiveName: String,
+    isExtractToFolder: Boolean = false,
     onConfirm: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -749,7 +879,8 @@ private fun ArchivePasswordDialog(
         text = {
             Column {
                 Text(
-                    "„$archiveName“ ist verschlüsselt. Bitte geben Sie das Passwort zum Einhängen ein:",
+                    if (isExtractToFolder) "„$archiveName“ ist verschlüsselt. Bitte geben Sie das Passwort zum Entpacken ein:"
+                    else "„$archiveName“ ist verschlüsselt. Bitte geben Sie das Passwort zum Einhängen ein:",
                     style = MaterialTheme.typography.bodyMedium,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
@@ -770,7 +901,7 @@ private fun ArchivePasswordDialog(
         },
         confirmButton = {
             TextButton(onClick = { onConfirm(password) }, enabled = password.isNotEmpty()) {
-                Text("Einhängen")
+                Text(if (isExtractToFolder) "Entpacken" else "Einhängen")
             }
         },
         dismissButton = {
@@ -824,28 +955,32 @@ private fun requestGoogleAccountDriveToken(
     context: Context,
     account: Account,
     onToken: (String) -> Unit,
-    onConsentIntent: ((Intent) -> Unit)?
+    onConsentIntent: ((Intent) -> Unit)?,
+    onFallbackToSaf: () -> Unit = {}
 ) {
     val accountManager = AccountManager.get(context)
     val authTokenType = "oauth2:https://www.googleapis.com/auth/drive"
-    accountManager.getAuthToken(
-        account,
-        authTokenType,
-        null,
-        false,
-        { future ->
-            runCatching {
-                val bundle = future.result
-                val token = bundle.getString(AccountManager.KEY_AUTHTOKEN)
-                @Suppress("DEPRECATION")
-                val consentIntent = bundle.getParcelable<Intent>(AccountManager.KEY_INTENT)
-                when {
-                    !token.isNullOrBlank() -> onToken(token)
-                    consentIntent != null && onConsentIntent != null -> onConsentIntent(consentIntent)
-                }
+    val activity = context.findActivity()
+    val callback = android.accounts.AccountManagerCallback<android.os.Bundle> { future ->
+        runCatching {
+            val bundle = future.result
+            val token = bundle.getString(AccountManager.KEY_AUTHTOKEN)
+            @Suppress("DEPRECATION")
+            val consentIntent = bundle.getParcelable<Intent>(AccountManager.KEY_INTENT)
+            when {
+                !token.isNullOrBlank() -> onToken(token)
+                consentIntent != null && onConsentIntent != null -> onConsentIntent(consentIntent)
+                else -> onFallbackToSaf()
             }
-        },
-        null
-    )
+        }.onFailure {
+            onFallbackToSaf()
+        }
+    }
+    if (activity != null) {
+        accountManager.getAuthToken(account, authTokenType, null, activity, callback, null)
+    } else {
+        accountManager.getAuthToken(account, authTokenType, null, false, callback, null)
+    }
 }
+
 

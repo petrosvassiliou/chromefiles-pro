@@ -517,7 +517,7 @@ class VirtualFileSystemRepository @Inject constructor(
             volumeId == VOLUME_RECENT || pathOrUri == "chromeos://recent" -> {
                 listRecentNodes(showHiddenFiles, recentCategoryFilter)
             }
-            volumeId == VOLUME_STARRED || pathOrUri == "chromeos://starred" -> {
+            pathOrUri == "chromeos://starred" || (volumeId == VOLUME_STARRED && pathOrUri.startsWith("chromeos://")) -> {
                 listStarredNodes(showHiddenFiles)
             }
             volumeId == VOLUME_DRIVE_OFFLINE || pathOrUri == "chromeos://drive_offline" -> {
@@ -714,18 +714,35 @@ class VirtualFileSystemRepository @Inject constructor(
                     else -> "Externer Ordner"
                 }
             val rootPath = _volumesFlow.value.firstOrNull { it.id == volumeId }?.rootPath ?: currentPath
-            return if (currentPath == rootPath) {
-                listOf(BreadcrumbSegment(title, rootPath, volumeId))
-            } else {
-                listOf(
-                    BreadcrumbSegment(title, rootPath, volumeId),
-                    BreadcrumbSegment(
-                        Uri.decode(currentPath.substringAfterLast('/')).substringAfterLast('/').substringAfterLast(':'),
-                        currentPath,
-                        volumeId
+            if (currentPath == rootPath) {
+                return listOf(BreadcrumbSegment(title, rootPath, volumeId))
+            }
+            val segments = mutableListOf(BreadcrumbSegment(title, rootPath, volumeId))
+            val rootBody = rootPath.removePrefix("saf://")
+            val curBody = currentPath.removePrefix("saf://")
+            val volPrefix = curBody.substringBefore('/')
+            val rootDocId = Uri.decode(rootBody.substringAfter('/', ""))
+            val curDocId = Uri.decode(curBody.substringAfter('/', ""))
+            if (rootDocId.isNotEmpty() && curDocId.startsWith(rootDocId) && curDocId != rootDocId) {
+                val suffix = curDocId.removePrefix(rootDocId).trimStart('/', ':')
+                val sep = if (curDocId.startsWith("$rootDocId/")) "/" else ":"
+                var running = rootDocId
+                suffix.split('/').filter { it.isNotEmpty() }.forEachIndexed { idx, part ->
+                    running = if (idx == 0 && sep == ":") "$running:$part" else "$running/$part"
+                    segments += BreadcrumbSegment(
+                        title = part,
+                        path = "saf://$volPrefix/${Uri.encode(running)}",
+                        volumeId = volumeId
                     )
+                }
+            } else {
+                segments += BreadcrumbSegment(
+                    title = curDocId.substringAfterLast('/').substringAfterLast(':').ifBlank { "Unterordner" },
+                    path = currentPath,
+                    volumeId = volumeId
                 )
             }
+            return segments
         }
 
         if (driveManager.isDriveApiPath(currentPath)) {
@@ -1296,6 +1313,152 @@ class VirtualFileSystemRepository @Inject constructor(
     }
 
     /**
+     * Entpackt ein Archiv (.zip, .rar, .7z, .tar, .tar.gz, .tgz) direkt als echten Ordner
+     * in das Zielverzeichnis ("Hier entpacken"). Unterstützt lokale Ordner, SAF und Google Drive.
+     */
+    suspend fun extractArchiveNode(
+        archiveNode: VfsNode,
+        destinationDirPath: String? = null,
+        destinationVolumeId: String? = null,
+        password: CharArray? = null
+    ): Result<VfsNode> = withContext(Dispatchers.IO) {
+        runCatching {
+            val localArchive = materialize(archiveNode).getOrThrow()
+            val targetParentPath = destinationDirPath?.takeIf { it.isNotBlank() } ?: archiveNode.parentPath
+            val targetVolumeId = destinationVolumeId?.takeIf { it.isNotBlank() } ?: archiveNode.volumeId
+            val lower = archiveNode.name.lowercase()
+            val rawBaseName = when {
+                lower.endsWith(".tar.gz") -> archiveNode.name.dropLast(7)
+                lower.endsWith(".tgz") -> archiveNode.name.dropLast(4)
+                archiveNode.name.contains('.') -> archiveNode.name.substringBeforeLast('.')
+                else -> "${archiveNode.name}_entpackt"
+            }.ifBlank { "Entpacktes_Archiv" }
+
+            val operationId = UUID.randomUUID().toString()
+            updateOperation(
+                FileOperationProgress(
+                    operationId = operationId,
+                    type = FileOperationType.EXTRACT,
+                    title = "„${archiveNode.name}“ wird entpackt …",
+                    currentFileName = archiveNode.name,
+                    processedFiles = 0,
+                    totalFiles = 1,
+                    processedBytes = 0L,
+                    totalBytes = localArchive.length().coerceAtLeast(1L),
+                    speedMegabytesPerSec = 0f,
+                    estimatedRemainingSeconds = 0L,
+                    status = FileOperationStatus.RUNNING
+                )
+            )
+
+            try {
+                if (safVolumes.isSafPath(targetParentPath) || driveManager.isDriveApiPath(targetParentPath)) {
+                    val tempExtractRoot = File(context.cacheDir, "extract_staging/${UUID.randomUUID()}/$rawBaseName").apply {
+                        deleteRecursively()
+                        mkdirs()
+                    }
+                    try {
+                        archiveManager.extractArchiveToDirectory(localArchive, tempExtractRoot, password).getOrThrow()
+                        val tempNode = fileToVfsNode(tempExtractRoot, VOLUME_MY_FILES)
+                        val transferred = executeSafOrDriveTransfer(
+                            operationId = UUID.randomUUID().toString(),
+                            nodes = listOf(tempNode),
+                            destinationDirPath = targetParentPath,
+                            destinationVolumeId = targetVolumeId,
+                            isMove = false,
+                            conflictResolution = ConflictResolution.KEEP_BOTH
+                        ).getOrThrow()
+                        updateOperation(
+                            FileOperationProgress(
+                                operationId = operationId,
+                                type = FileOperationType.EXTRACT,
+                                title = "„${archiveNode.name}“ entpackt",
+                                currentFileName = "Abgeschlossen",
+                                processedFiles = 1,
+                                totalFiles = 1,
+                                processedBytes = localArchive.length().coerceAtLeast(1L),
+                                totalBytes = localArchive.length().coerceAtLeast(1L),
+                                speedMegabytesPerSec = 0f,
+                                estimatedRemainingSeconds = 0L,
+                                status = FileOperationStatus.COMPLETED
+                            )
+                        )
+                        refreshVolumes()
+                        return@runCatching transferred.firstOrNull() ?: tempNode
+                    } finally {
+                        tempExtractRoot.parentFile?.deleteRecursively()
+                    }
+                }
+
+                val parentDir = File(targetParentPath).apply { mkdirs() }
+                val targetFolder = resolveUniqueFile(File(parentDir, rawBaseName))
+                archiveManager.extractArchiveToDirectory(localArchive, targetFolder, password).getOrThrow()
+
+                // Falls das Archiv genau 1 gleichnamigen Wurzelordner enthielt, unnötige Verschachtelung auflösen
+                val topChildren = targetFolder.listFiles().orEmpty()
+                if (topChildren.size == 1 && topChildren.first().isDirectory &&
+                    topChildren.first().name.equals(rawBaseName, ignoreCase = true)
+                ) {
+                    val inner = topChildren.first()
+                    val tempUnwrap = File(parentDir, ".unwrap_${UUID.randomUUID()}")
+                    if (inner.renameTo(tempUnwrap)) {
+                        targetFolder.deleteRecursively()
+                        tempUnwrap.renameTo(targetFolder)
+                    }
+                }
+
+                val extractedSize = calculateDirectorySize(targetFolder)
+                updateOperation(
+                    FileOperationProgress(
+                        operationId = operationId,
+                        type = FileOperationType.EXTRACT,
+                        title = "„${archiveNode.name}“ nach „${targetFolder.name}“ entpackt",
+                        currentFileName = "Abgeschlossen",
+                        processedFiles = 1,
+                        totalFiles = 1,
+                        processedBytes = extractedSize.coerceAtLeast(1L),
+                        totalBytes = extractedSize.coerceAtLeast(1L),
+                        speedMegabytesPerSec = 0f,
+                        estimatedRemainingSeconds = 0L,
+                        status = FileOperationStatus.COMPLETED
+                    )
+                )
+
+                val entity = FileMetadataEntity(
+                    path = targetFolder.absolutePath,
+                    name = targetFolder.name,
+                    volumeId = targetVolumeId,
+                    mimeType = "vnd.android.document/directory",
+                    lastModifiedMillis = targetFolder.lastModified(),
+                    sizeBytes = 0L,
+                    isDirectory = true
+                )
+                dao.upsertMetadata(entity)
+                refreshVolumes()
+                fileToVfsNode(targetFolder, targetVolumeId, entity)
+            } catch (e: Exception) {
+                updateOperation(
+                    FileOperationProgress(
+                        operationId = operationId,
+                        type = FileOperationType.EXTRACT,
+                        title = "Entpacken fehlgeschlagen",
+                        currentFileName = e.message ?: "Fehler beim Entpacken",
+                        processedFiles = 0,
+                        totalFiles = 1,
+                        processedBytes = 0L,
+                        totalBytes = 1L,
+                        speedMegabytesPerSec = 0f,
+                        estimatedRemainingSeconds = 0L,
+                        status = FileOperationStatus.FAILED,
+                        errorMessage = e.message
+                    )
+                )
+                throw e
+            }
+        }
+    }
+
+    /**
      * Wirft ein eingehängtes Archiv, ein SAF-Laufwerk, Google Drive oder eine SMB/SFTP-Verbindung aus.
      */
     suspend fun ejectVolume(volumeId: String): Boolean = withContext(Dispatchers.IO) {
@@ -1333,7 +1496,7 @@ class VirtualFileSystemRepository @Inject constructor(
     )
 
     /**
-     * Komprimiert eine Auswahl von Dateien/Ordnern in das gewählte Archivformat (.zip, .tar.gz, .7z).
+     * Komprimiert eine Auswahl von Dateien/Ordnern in das gewählte Archivformat (.zip, .rar, .tar.gz, .7z).
      */
     suspend fun compressSelectionToArchive(
         nodes: List<VfsNode>,
@@ -1343,67 +1506,101 @@ class VirtualFileSystemRepository @Inject constructor(
     ): Result<VfsNode> = withContext(Dispatchers.IO) {
         runCatching {
             require(nodes.isNotEmpty()) { "Keine Dateien zum Komprimieren ausgewählt." }
-            val firstParent = File(nodes.first().parentPath)
+            val parentPath = nodes.first().parentPath
+            val targetVolumeId = nodes.first().volumeId
+            val isRemoteOrSafTarget = safVolumes.isSafPath(parentPath) || driveManager.isDriveApiPath(parentPath)
             val extSuffix = ".${format.extension}"
-            val baseName = destinationName?.takeIf { it.isNotBlank() }
+            val rawName = destinationName?.trim()?.takeIf { it.isNotBlank() }
                 ?: if (nodes.size == 1) {
-                    "${nodes.first().name.substringBeforeLast('.')}$extSuffix"
+                    val n = nodes.first().name
+                    val stem = if (!nodes.first().isDirectory && n.contains('.')) n.substringBeforeLast('.') else n
+                    "$stem$extSuffix"
                 } else {
                     "Archiv_${nodes.size}_Elemente$extSuffix"
                 }
-            val finalArchiveFile = resolveUniqueFile(
-                File(firstParent, if (baseName.endsWith(extSuffix, true)) baseName else "$baseName$extSuffix")
-            )
+            val fileNameWithExt = if (rawName.endsWith(extSuffix, ignoreCase = true)) rawName else "$rawName$extSuffix"
+
+            val stagingDir = if (isRemoteOrSafTarget) {
+                File(context.cacheDir, "compress_staging/${UUID.randomUUID()}").apply { mkdirs() }
+            } else {
+                File(parentPath).apply { mkdirs() }
+            }
+            val finalArchiveFile = resolveUniqueFile(File(stagingDir, fileNameWithExt))
 
             val operationId = UUID.randomUUID().toString()
-            val sourceFiles = nodes.map { File(it.path) }.filter { it.exists() }
+            val sourceFiles = nodes.mapNotNull { node ->
+                if (!node.isRemote) {
+                    File(node.path).takeIf { it.exists() }
+                } else if (!node.isDirectory) {
+                    materialize(node).getOrNull()
+                } else {
+                    null
+                }
+            }
+            require(sourceFiles.isNotEmpty()) { "Quelldateien konnten zum Komprimieren nicht gelesen werden." }
             val sizesPerSource = sourceFiles.map { calculateDirectorySizeOrFileSize(it) }
             val totalBytes = sizesPerSource.sum().coerceAtLeast(1L)
             val compressStartMillis = System.currentTimeMillis()
 
-            archiveManager.compressNodesToArchive(
-                sourceFiles = sourceFiles,
-                destinationFile = finalArchiveFile,
-                format = format,
-                password = password,
-                onProgress = { index, total, currentName ->
-                    val doneBytes = sizesPerSource.take(index.coerceAtMost(sizesPerSource.size)).sum()
-                    val elapsedSec = ((System.currentTimeMillis() - compressStartMillis) / 1000f).coerceAtLeast(0.05f)
-                    val speedMbps = (doneBytes / (1024f * 1024f)) / elapsedSec
-                    val remainingSec = if (speedMbps > 0.01f) {
-                        (((totalBytes - doneBytes).coerceAtLeast(0L) / (1024f * 1024f)) / speedMbps).toLong()
-                    } else {
-                        0L
-                    }
-                    updateOperation(
-                        FileOperationProgress(
-                            operationId = operationId,
-                            type = FileOperationType.COMPRESS,
-                            title = "${format.labelDe} wird erstellt (${finalArchiveFile.name})",
-                            currentFileName = currentName,
-                            processedFiles = index,
-                            totalFiles = total,
-                            processedBytes = doneBytes,
-                            totalBytes = totalBytes,
-                            speedMegabytesPerSec = speedMbps,
-                            estimatedRemainingSeconds = remainingSec,
-                            status = if (index >= total) FileOperationStatus.COMPLETED else FileOperationStatus.RUNNING
+            try {
+                archiveManager.compressNodesToArchive(
+                    sourceFiles = sourceFiles,
+                    destinationFile = finalArchiveFile,
+                    format = format,
+                    password = password,
+                    onProgress = { index, total, currentName ->
+                        val doneBytes = sizesPerSource.take(index.coerceAtMost(sizesPerSource.size)).sum()
+                        val elapsedSec = ((System.currentTimeMillis() - compressStartMillis) / 1000f).coerceAtLeast(0.05f)
+                        val speedMbps = (doneBytes / (1024f * 1024f)) / elapsedSec
+                        val remainingSec = if (speedMbps > 0.01f) {
+                            (((totalBytes - doneBytes).coerceAtLeast(0L) / (1024f * 1024f)) / speedMbps).toLong()
+                        } else {
+                            0L
+                        }
+                        updateOperation(
+                            FileOperationProgress(
+                                operationId = operationId,
+                                type = FileOperationType.COMPRESS,
+                                title = "${format.labelDe} wird erstellt (${finalArchiveFile.name})",
+                                currentFileName = currentName,
+                                processedFiles = index,
+                                totalFiles = total,
+                                processedBytes = doneBytes,
+                                totalBytes = totalBytes,
+                                speedMegabytesPerSec = speedMbps,
+                                estimatedRemainingSeconds = remainingSec,
+                                status = if (index >= total) FileOperationStatus.COMPLETED else FileOperationStatus.RUNNING
+                            )
                         )
-                    )
-                }
-            ).getOrThrow()
+                    }
+                ).getOrThrow()
 
-            val entity = FileMetadataEntity(
-                path = finalArchiveFile.absolutePath,
-                name = finalArchiveFile.name,
-                volumeId = nodes.first().volumeId,
-                mimeType = format.mimeType,
-                lastModifiedMillis = finalArchiveFile.lastModified(),
-                sizeBytes = finalArchiveFile.length(),
-                isDirectory = false
-            )
-            dao.upsertMetadata(entity)
-            fileToVfsNode(finalArchiveFile, nodes.first().volumeId, entity)
+                if (safVolumes.isSafPath(parentPath)) {
+                    val uploaded = safVolumes.copyLocalFileToSaf(finalArchiveFile, parentPath, format.mimeType, targetVolumeId)
+                    stagingDir.deleteRecursively()
+                    return@runCatching uploaded
+                }
+                if (driveManager.isDriveApiPath(parentPath)) {
+                    val uploaded = driveManager.uploadLocalFile(finalArchiveFile, parentPath, format.mimeType, targetVolumeId)
+                    stagingDir.deleteRecursively()
+                    return@runCatching uploaded
+                }
+
+                val entity = FileMetadataEntity(
+                    path = finalArchiveFile.absolutePath,
+                    name = finalArchiveFile.name,
+                    volumeId = targetVolumeId,
+                    mimeType = format.mimeType,
+                    lastModifiedMillis = finalArchiveFile.lastModified(),
+                    sizeBytes = finalArchiveFile.length(),
+                    isDirectory = false
+                )
+                dao.upsertMetadata(entity)
+                fileToVfsNode(finalArchiveFile, targetVolumeId, entity)
+            } catch (e: Exception) {
+                if (isRemoteOrSafTarget) stagingDir.deleteRecursively()
+                throw e
+            }
         }
     }
 
@@ -1525,6 +1722,7 @@ class VirtualFileSystemRepository @Inject constructor(
                 )
             )
         }
+        refreshVolumes()
         node.copy(isStarred = newStarred)
     }
 
@@ -2378,13 +2576,66 @@ class VirtualFileSystemRepository @Inject constructor(
         }.filter { matchesFileTypeFilter(it, categoryFilter) }
     }
 
+    suspend fun listSubdirectories(
+        pathOrUri: String,
+        volumeId: String,
+        showHiddenFiles: Boolean
+    ): List<VfsNode> = withContext(Dispatchers.IO) {
+        when {
+            safVolumes.isSafPath(pathOrUri) -> {
+                safVolumes.listSubdirectories(pathOrUri, volumeId, showHiddenFiles)
+            }
+            driveManager.isDriveApiPath(pathOrUri) -> {
+                driveManager.list(pathOrUri, volumeId, showHiddenFiles)
+                    .filter { it.isDirectory }
+                    .sortedBy { it.name.lowercase() }
+            }
+            else -> {
+                val dir = File(pathOrUri)
+                if (!dir.exists() || !dir.isDirectory) emptyList()
+                else dir.listFiles().orEmpty()
+                    .filter { it.isDirectory && (showHiddenFiles || !it.name.startsWith(".")) }
+                    .sortedBy { it.name.lowercase() }
+                    .map { fileToVfsNode(it, volumeId) }
+            }
+        }
+    }
+
     private suspend fun listStarredNodes(showHiddenFiles: Boolean): List<VfsNode> {
         val starredEntities = dao.getStarredFiles()
         return starredEntities.mapNotNull { entity ->
-            val file = File(entity.path)
-            if (!file.exists()) return@mapNotNull null
-            if (!showHiddenFiles && file.name.startsWith(".")) return@mapNotNull null
-            fileToVfsNode(file, entity.volumeId, entity)
+            if (!showHiddenFiles && entity.name.startsWith(".")) return@mapNotNull null
+            when {
+                safVolumes.isSafPath(entity.path) ||
+                    driveManager.isDriveApiPath(entity.path) ||
+                    remoteVolumes.isRemotePath(entity.path) -> {
+                    val tagsList = entity.tags
+                        .split(',')
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                    val ext = if (entity.isDirectory) "" else entity.name.substringAfterLast('.', "").lowercase()
+                    VfsNode(
+                        id = entity.path,
+                        name = entity.name,
+                        path = entity.path,
+                        parentPath = entity.path.substringBeforeLast('/', ""),
+                        volumeId = entity.volumeId,
+                        isDirectory = entity.isDirectory,
+                        sizeBytes = entity.sizeBytes,
+                        lastModifiedMillis = entity.lastModifiedMillis,
+                        mimeType = entity.mimeType,
+                        extension = ext,
+                        isStarred = true,
+                        isOfflinePinned = entity.isOfflinePinned,
+                        tags = tagsList
+                    )
+                }
+                else -> {
+                    val file = File(entity.path)
+                    if (!file.exists()) return@mapNotNull null
+                    fileToVfsNode(file, entity.volumeId, entity)
+                }
+            }
         }
     }
 

@@ -1,9 +1,13 @@
 package de.chromefiles.app.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -12,27 +16,44 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.outlined.AccountCircle
+import androidx.compose.material.icons.outlined.Archive
+import androidx.compose.material.icons.outlined.ArrowUpward
 import androidx.compose.material.icons.outlined.CloudSync
+import androidx.compose.material.icons.outlined.ContentCopy
+import androidx.compose.material.icons.outlined.ContentCut
+import androidx.compose.material.icons.outlined.ContentPaste
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material.icons.outlined.DriveFileRenameOutline
 import androidx.compose.material.icons.outlined.FolderOpen
 import androidx.compose.material.icons.outlined.FolderShared
 import androidx.compose.material.icons.outlined.LockOpen
+import androidx.compose.material.icons.outlined.MoreVert
+import androidx.compose.material.icons.outlined.StarOutline
 import androidx.compose.material.icons.outlined.Terminal
+import androidx.compose.material.icons.outlined.Unarchive
+import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
@@ -48,6 +69,9 @@ import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_LINUX
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_MY_FILES
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_RECENT
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_STARRED
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_TRASH
+import de.chromefiles.app.model.BreadcrumbSegment
 import de.chromefiles.app.model.VfsNode
 import de.chromefiles.app.ui.components.ChromeOsTopBar
 import de.chromefiles.app.ui.components.EmptyFolderState
@@ -58,6 +82,7 @@ import de.chromefiles.app.ui.components.FileListView
 import de.chromefiles.app.ui.components.RecentFilterChipRow
 import de.chromefiles.app.ui.components.SearchFilterChipRow
 import de.chromefiles.app.ui.components.fileAreaPointerHandling
+import de.chromefiles.app.ui.dnd.ActiveDragState
 import de.chromefiles.app.ui.dnd.DropPayload
 import de.chromefiles.app.ui.dnd.buildDragTransferData
 import de.chromefiles.app.ui.dnd.fileDropTarget
@@ -69,8 +94,8 @@ import de.chromefiles.app.ui.viewmodel.FileViewMode
 import de.chromefiles.app.ui.viewmodel.PaneController
 
 /**
- * Eine vollständige Dateiansicht (Kopfzeile, Filterchips, Liste/Raster) – ein Tab
- * oder eine Hälfte der Dual-Pane-Ansicht.
+ * Eine vollständige Dateiansicht (Kopfzeile, Filterchips, Schnell-Drop-Leiste, Auswahl-Aktionsleiste,
+ * Liste/Raster) – ein Tab oder eine Hälfte der Dual-Pane-Ansicht.
  */
 @Composable
 fun PaneView(
@@ -99,13 +124,24 @@ fun PaneView(
     val requestKeyboardFocus by rememberUpdatedState(onRequestKeyboardFocus)
     val callbacks = remember(controller, viewModel) {
         FileItemCallbacks(
-            onClick = { node, ctrl, shift ->
+            onClick = { node, ctrl, shift, isTouch ->
                 viewModel.focusPane(paneId)
                 if (controller.current.renamingId != null) requestKeyboardFocus()
-                controller.onNodeClicked(node, ctrl, shift)
+                if (isTouch && !ctrl && !shift) {
+                    if (controller.current.selectedIds.isNotEmpty()) {
+                        controller.onNodeClicked(node, ctrl = true, shift = false)
+                    } else if (node.isDirectory) {
+                        viewModel.openNode(paneId, node)
+                    } else {
+                        controller.onNodeClicked(node, ctrl = false, shift = false)
+                    }
+                } else {
+                    controller.onNodeClicked(node, ctrl, shift)
+                }
             },
             onOpen = { node -> viewModel.openNode(paneId, node) },
             onContextMenu = { node -> viewModel.showContextMenu(paneId, node) },
+            onToggleStarred = { node -> viewModel.toggleStarred(node) },
             onPrepareDrag = { node ->
                 if (controller.current.isTrash) {
                     null
@@ -223,6 +259,85 @@ fun PaneView(
                     viewModel.handleDrop(payload, DropDestination(segment.path, segment.volumeId))
                 }
             )
+
+            // Drag & Drop Schnell-Ablageleiste (immer sichtbar während eines Drags – auch auf Smartphones!)
+            AnimatedVisibility(visible = ActiveDragState.nodes.isNotEmpty()) {
+                val parentBreadcrumb = pane.breadcrumbs.getOrNull(pane.breadcrumbs.lastIndex - 1)
+                QuickDropZonesBar(
+                    parentSegment = parentBreadcrumb,
+                    onDropToStarred = { payload ->
+                        viewModel.handleDrop(payload, DropDestination("chromeos://starred", VOLUME_STARRED))
+                    },
+                    onDropToParent = { segment, payload ->
+                        viewModel.handleDrop(payload, DropDestination(segment.path, segment.volumeId))
+                    },
+                    onDropToTrash = { payload ->
+                        viewModel.handleDrop(payload, DropDestination("chromeos://trash", VOLUME_TRASH))
+                    }
+                )
+            }
+
+            // Kontext-Aktionsleiste bei ausgewählten Elementen (1-Tipp für Favorit, Kopieren, Komprimieren, Entpacken, Menü)
+            AnimatedVisibility(visible = pane.selectedIds.isNotEmpty() && !pane.isTrash) {
+                val selectedNodes = pane.selectedNodes
+                val allStarred = selectedNodes.isNotEmpty() && selectedNodes.all { it.isStarred }
+                val singleArchive = selectedNodes.singleOrNull()?.takeIf { it.isArchive }
+                SelectionActionBar(
+                    selectedCount = pane.selectedIds.size,
+                    allStarred = allStarred,
+                    canWriteHere = pane.isWritableLocation,
+                    hasClipboard = ui.clipboard != null,
+                    singleArchiveNode = singleArchive,
+                    onToggleStarred = { viewModel.toggleStarredSelection(paneId) },
+                    onCopy = { viewModel.copySelection(paneId, isCut = false) },
+                    onCut = { viewModel.copySelection(paneId, isCut = true) },
+                    onPaste = { viewModel.paste(paneId) },
+                    onCompress = { viewModel.showCompressDialog(paneId) },
+                    onExtractArchive = { archive -> viewModel.extractArchive(paneId, archive) },
+                    onRename = { viewModel.startRename(paneId) },
+                    onDelete = { viewModel.trashSelection(paneId) },
+                    onOpenContextMenu = {
+                        viewModel.showContextMenu(paneId, pane.leadNode ?: selectedNodes.firstOrNull())
+                    },
+                    onClearSelection = controller::clearSelection
+                )
+            }
+
+            // Zwischenablage-Einfügeleiste, wenn Elemente kopiert/ausgeschnitten wurden
+            AnimatedVisibility(
+                visible = ui.clipboard != null && pane.selectedIds.isEmpty() && pane.isWritableLocation && !pane.isTrash
+            ) {
+                ui.clipboard?.let { clip ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(MaterialTheme.colorScheme.secondaryContainer)
+                            .padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            Icons.Outlined.ContentPaste,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = if (clip.isCut) "${clip.nodes.size} Element(e) zum Verschieben bereit"
+                            else "${clip.nodes.size} Element(e) in der Zwischenablage",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSecondaryContainer,
+                            modifier = Modifier.weight(1f)
+                        )
+                        TextButton(onClick = { viewModel.paste(paneId) }) {
+                            Text("Hier einfügen")
+                        }
+                    }
+                }
+            }
+
             if (pane.isSearchOpen) {
                 SearchFilterChipRow(
                     filter = pane.searchFilter,
@@ -258,7 +373,11 @@ fun PaneView(
                         )
                     }
                     pane.nodes.isEmpty() -> Box(modifier = containerModifier.fillMaxSize()) {
-                        EmptyFolderState(isSearch = pane.isShowingSearchResults, isLoading = pane.isLoading)
+                        EmptyFolderState(
+                            isSearch = pane.isShowingSearchResults,
+                            isLoading = pane.isLoading,
+                            isStarred = pane.currentVolumeId == VOLUME_STARRED
+                        )
                     }
                     pane.viewMode == FileViewMode.LIST -> FileListView(
                         nodes = pane.nodes,
@@ -289,6 +408,206 @@ fun PaneView(
 }
 
 @Composable
+private fun QuickDropZonesBar(
+    parentSegment: BreadcrumbSegment?,
+    onDropToStarred: (DropPayload) -> Boolean,
+    onDropToParent: (BreadcrumbSegment, DropPayload) -> Boolean,
+    onDropToTrash: (DropPayload) -> Boolean
+) {
+    val colors = MaterialTheme.colorScheme
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        val chipShape = RoundedCornerShape(12.dp)
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .clip(chipShape)
+                .fileDropTarget(enabled = true, shape = chipShape, onDrop = onDropToStarred)
+                .border(1.dp, colors.primary.copy(alpha = 0.5f), chipShape)
+                .background(colors.primaryContainer.copy(alpha = 0.45f))
+                .padding(horizontal = 10.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(Icons.Filled.Star, contentDescription = null, tint = Color(0xFFF9AB00), modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "Zu Favoriten (Drop)",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+        }
+        if (parentSegment != null) {
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .clip(chipShape)
+                    .fileDropTarget(
+                        enabled = true,
+                        shape = chipShape,
+                        onDrop = { payload -> onDropToParent(parentSegment, payload) }
+                    )
+                    .border(1.dp, colors.secondary.copy(alpha = 0.5f), chipShape)
+                    .background(colors.secondaryContainer.copy(alpha = 0.45f))
+                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Icon(Icons.Outlined.ArrowUpward, contentDescription = null, tint = colors.onSecondaryContainer, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(6.dp))
+                Text(
+                    text = "Nach „${parentSegment.title}“",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
+                )
+            }
+        }
+        Row(
+            modifier = Modifier
+                .weight(1f)
+                .clip(chipShape)
+                .fileDropTarget(enabled = true, shape = chipShape, onDrop = onDropToTrash)
+                .border(1.dp, colors.error.copy(alpha = 0.5f), chipShape)
+                .background(colors.errorContainer.copy(alpha = 0.45f))
+                .padding(horizontal = 10.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center
+        ) {
+            Icon(Icons.Outlined.Delete, contentDescription = null, tint = colors.error, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(
+                text = "Papierkorb (Drop)",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1
+            )
+        }
+    }
+}
+
+@Composable
+private fun SelectionActionBar(
+    selectedCount: Int,
+    allStarred: Boolean,
+    canWriteHere: Boolean,
+    hasClipboard: Boolean,
+    singleArchiveNode: VfsNode?,
+    onToggleStarred: () -> Unit,
+    onCopy: () -> Unit,
+    onCut: () -> Unit,
+    onPaste: () -> Unit,
+    onCompress: () -> Unit,
+    onExtractArchive: (VfsNode) -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onOpenContextMenu: () -> Unit,
+    onClearSelection: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp, vertical = 4.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+            .horizontalScroll(rememberScrollState())
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        IconButton(onClick = onClearSelection, modifier = Modifier.size(32.dp)) {
+            Icon(Icons.Filled.Close, contentDescription = "Auswahl aufheben", modifier = Modifier.size(18.dp))
+        }
+        Text(
+            text = "$selectedCount ausgewählt",
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(end = 4.dp)
+        )
+        AssistChip(
+            onClick = onToggleStarred,
+            label = { Text(if (allStarred) "Favorit entfernen" else "Als Favorit") },
+            leadingIcon = {
+                Icon(
+                    imageVector = if (allStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
+                    contentDescription = null,
+                    tint = if (allStarred) Color(0xFFF9AB00) else MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+        )
+        if (singleArchiveNode != null && canWriteHere) {
+            AssistChip(
+                onClick = { onExtractArchive(singleArchiveNode) },
+                label = { Text("Hier entpacken") },
+                leadingIcon = {
+                    Icon(Icons.Outlined.Unarchive, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+            )
+        }
+        if (canWriteHere) {
+            AssistChip(
+                onClick = onCompress,
+                label = { Text("Komprimieren (ZIP/RAR)") },
+                leadingIcon = {
+                    Icon(Icons.Outlined.Archive, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+            )
+        }
+        AssistChip(
+            onClick = onCopy,
+            label = { Text("Kopieren") },
+            leadingIcon = {
+                Icon(Icons.Outlined.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+            }
+        )
+        AssistChip(
+            onClick = onCut,
+            label = { Text("Ausschneiden") },
+            leadingIcon = {
+                Icon(Icons.Outlined.ContentCut, contentDescription = null, modifier = Modifier.size(16.dp))
+            }
+        )
+        if (hasClipboard && canWriteHere) {
+            AssistChip(
+                onClick = onPaste,
+                label = { Text("Einfügen") },
+                leadingIcon = {
+                    Icon(Icons.Outlined.ContentPaste, contentDescription = null, modifier = Modifier.size(16.dp))
+                }
+            )
+        }
+        AssistChip(
+            onClick = onRename,
+            label = { Text("Umbenennen") },
+            leadingIcon = {
+                Icon(Icons.Outlined.DriveFileRenameOutline, contentDescription = null, modifier = Modifier.size(16.dp))
+            }
+        )
+        AssistChip(
+            onClick = onDelete,
+            label = { Text("Löschen") },
+            leadingIcon = {
+                Icon(Icons.Outlined.Delete, contentDescription = null, modifier = Modifier.size(16.dp))
+            }
+        )
+        AssistChip(
+            onClick = onOpenContextMenu,
+            label = { Text("Mehr") },
+            leadingIcon = {
+                Icon(Icons.Outlined.MoreVert, contentDescription = null, modifier = Modifier.size(16.dp))
+            }
+        )
+    }
+}
+
+@Composable
 private fun StoragePermissionOnboardingCard(
     onGrantAllFilesAccess: () -> Unit,
     onPickSafFolder: () -> Unit
@@ -315,7 +634,7 @@ private fun StoragePermissionOnboardingCard(
                 textAlign = TextAlign.Center
             )
             Text(
-                text = "Damit ChromeFiles Pro Ihre echten lokalen Ordner und Dateien (/storage/emulated/0 – Download, DCIM, Documents, Pictures, Music usw.) anzeigen und verwalten kann, aktivieren Sie bitte die Android-Berechtigung „Zugriff auf alle Dateien“.",
+                text = "Damit Files Pro Ihre echten lokalen Ordner und Dateien (/storage/emulated/0 – Download, DCIM, Documents, Pictures, Music usw.) anzeigen und verwalten kann, aktivieren Sie bitte die Android-Berechtigung „Zugriff auf alle Dateien“.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
@@ -369,7 +688,7 @@ private fun GoogleDriveOnboardingCard(
                 textAlign = TextAlign.Center
             )
             Text(
-                text = "Verbinden Sie Ihr Google-Konto, um direkt auf Ihre echte „Meine Ablage“, „Geteilte Ablagen“ und „Für mich freigegeben“-Dateien zuzugreifen.",
+                text = "Verbinden Sie Ihr Google-Konto per 1-Klick oder binden Sie Ihr Google Drive direkt über das Android-Dateisystem ein, um sofort auf Ihre Ordner und Dateien zuzugreifen.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
@@ -446,4 +765,5 @@ private fun LinuxOnboardingCard(
         }
     }
 }
+
 

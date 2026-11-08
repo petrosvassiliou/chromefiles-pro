@@ -8,6 +8,7 @@ import de.chromefiles.app.data.clipboard.SystemClipboardBridge
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_DRIVE
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_DRIVE_OFFLINE
+import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_LINUX
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_MY_FILES
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_RECENT
 import de.chromefiles.app.data.vfs.VirtualFileSystemRepository.Companion.VOLUME_STARRED
@@ -68,6 +69,9 @@ data class ClipboardState(val nodes: List<VfsNode>, val isCut: Boolean)
 /** Offenes Rechtsklick-Menü; [target] == null bedeutet Klick auf freie Fläche. */
 data class ContextMenuState(val paneId: String, val target: VfsNode?)
 
+/** Dialog zum Komprimieren ausgewählter Elemente in ZIP / RAR / 7Z / TAR.GZ. */
+data class CompressDialogState(val paneId: String, val nodes: List<VfsNode>)
+
 /** Ablageziel für Drag & Drop (Ordnerzeile, Seitenleiste, Breadcrumb oder Pane-Hintergrund). */
 data class DropDestination(val path: String, val volumeId: String)
 
@@ -103,9 +107,11 @@ data class ChromeFilesUiState(
     val detailedNode: VfsNode? = null,
     val clipboard: ClipboardState? = null,
     val contextMenu: ContextMenuState? = null,
+    val compressDialog: CompressDialogState? = null,
     val newFolderPaneId: String? = null,
     val pendingPermanentDelete: List<VfsNode>? = null,
     val pendingArchivePasswordNode: Pair<String, VfsNode>? = null,
+    val pendingArchiveExtractToFolder: Boolean = false,
     val pendingBatchRenameNodes: Pair<String, List<VfsNode>>? = null,
     val quickView: QuickViewState? = null,
     val networkDialog: NetworkDialogState? = null,
@@ -297,17 +303,17 @@ class ChromeFilesViewModel @Inject constructor(
         }
     }
 
-    /** Remote-Dateien (SMB/SFTP/WebDAV) werden vor dem Öffnen in den Cache geladen. */
+    /** Remote-, SAF- und Google-Drive-Dateien werden vor dem externen Öffnen in den Cache geladen. */
     private fun emitOpenFile(node: VfsNode) {
-        if (!node.isRemote) {
+        if (!node.isRemote && !node.isSaf && !node.isGoogleDriveApi) {
             _openFileEvents.tryEmit(node)
             return
         }
         viewModelScope.launch {
-            postMessage("„${node.name}“ wird heruntergeladen …")
+            postMessage("„${node.name}“ wird vorbereitet …")
             repository.materialize(node)
                 .onSuccess { local -> _openFileEvents.tryEmit(node.copy(path = local.absolutePath)) }
-                .onFailure { postMessage("Download fehlgeschlagen: ${it.message}") }
+                .onFailure { postMessage("Datei konnte nicht geöffnet werden: ${it.message}") }
         }
     }
 
@@ -349,10 +355,11 @@ class ChromeFilesViewModel @Inject constructor(
         imageEditor.scale(file, width, height)
     }
 
-    fun imageSizeFor(node: VfsNode): Pair<Int, Int>? = if (node.isRemote) null else imageEditor.orientedSize(File(node.path))
+    fun imageSizeFor(node: VfsNode): Pair<Int, Int>? =
+        if (node.isRemote || node.isSaf || node.isGoogleDriveApi) null else imageEditor.orientedSize(File(node.path))
 
     fun canEditImage(node: VfsNode): Boolean =
-        node.isImage && !node.isRemote && !node.isReadOnly && imageEditor.isEditable(node.extension)
+        node.isImage && !node.isRemote && !node.isSaf && !node.isGoogleDriveApi && !node.isReadOnly && imageEditor.isEditable(node.extension)
 
     /** Speichert Änderungen aus dem integrierten Text-/Code-Editor im QuickView zurück in die Datei. */
     fun saveQuickViewText(newText: String) {
@@ -449,12 +456,16 @@ class ChromeFilesViewModel @Inject constructor(
     // ================================================================== SAF (Linux-Crostini / USB / Google Drive) & Gerätespeicher
 
     fun onSafTreeSelected(treeUri: Uri, asLinuxContainer: Boolean, asGoogleDrive: Boolean = false) {
+        val currentVol = focused?.current?.currentVolumeId
+        val effectiveAsDrive = asGoogleDrive || (!asLinuxContainer && currentVol == VOLUME_DRIVE)
+        val effectiveAsLinux = asLinuxContainer || (!effectiveAsDrive && currentVol == VOLUME_LINUX)
         viewModelScope.launch {
-            repository.safVolumes.registerTreeUri(treeUri, asLinuxContainer, asGoogleDrive)
+            repository.safVolumes.registerTreeUri(treeUri, effectiveAsLinux, effectiveAsDrive)
                 .onSuccess { volume ->
                     repository.refreshVolumes()
                     postMessage("„${volume.title}“ wurde erfolgreich eingebunden.")
                     focused?.navigateTo(volume.rootPath, volume.id)
+                    reloadAllPanes()
                     rebuildSidebar()
                 }
                 .onFailure { err ->
@@ -614,7 +625,7 @@ class ChromeFilesViewModel @Inject constructor(
     }
 
     fun mountArchive(paneId: String, node: VfsNode, password: String? = null) {
-        _uiState.update { it.copy(pendingArchivePasswordNode = null) }
+        _uiState.update { it.copy(pendingArchivePasswordNode = null, pendingArchiveExtractToFolder = false) }
         viewModelScope.launch {
             repository.mountArchiveNode(node, password?.toCharArray())
                 .onSuccess { volume ->
@@ -623,7 +634,12 @@ class ChromeFilesViewModel @Inject constructor(
                 }
                 .onFailure { err ->
                     if (err is ArchivePasswordRequiredException || err.cause is ArchivePasswordRequiredException) {
-                        _uiState.update { it.copy(pendingArchivePasswordNode = paneId to node) }
+                        _uiState.update {
+                            it.copy(
+                                pendingArchivePasswordNode = paneId to node,
+                                pendingArchiveExtractToFolder = false
+                            )
+                        }
                         if (!password.isNullOrEmpty()) {
                             postMessage("Falsches Passwort für „${node.name}“.")
                         }
@@ -634,7 +650,53 @@ class ChromeFilesViewModel @Inject constructor(
         }
     }
 
-    fun dismissArchivePasswordDialog() = _uiState.update { it.copy(pendingArchivePasswordNode = null) }
+    /** Entpackt ein Archiv (.zip, .rar, .7z, .tar.gz) direkt in einen Unterordner im aktuellen Verzeichnis. */
+    fun extractArchive(paneId: String, node: VfsNode, password: String? = null) {
+        val pane = panes[paneId] ?: return
+        _uiState.update { it.copy(pendingArchivePasswordNode = null, pendingArchiveExtractToFolder = false) }
+        viewModelScope.launch {
+            postMessage("„${node.name}“ wird entpackt …")
+            repository.extractArchiveNode(
+                archiveNode = node,
+                destinationDirPath = pane.current.currentPath,
+                destinationVolumeId = pane.current.currentVolumeId,
+                password = password?.toCharArray()
+            ).onSuccess { extractedFolder ->
+                postMessage("„${node.name}“ wurde nach „${extractedFolder.name}“ entpackt.")
+                pane.reload()
+                pane.selectIds(setOf(extractedFolder.id))
+                rebuildSidebar()
+            }.onFailure { err ->
+                if (err is ArchivePasswordRequiredException || err.cause is ArchivePasswordRequiredException) {
+                    _uiState.update {
+                        it.copy(
+                            pendingArchivePasswordNode = paneId to node,
+                            pendingArchiveExtractToFolder = true
+                        )
+                    }
+                    if (!password.isNullOrEmpty()) {
+                        postMessage("Falsches Passwort für „${node.name}“.")
+                    }
+                } else {
+                    postMessage("Entpacken fehlgeschlagen: ${err.message}")
+                }
+            }
+        }
+    }
+
+    fun submitArchivePassword(password: String) {
+        val state = _uiState.value
+        val (paneId, archiveNode) = state.pendingArchivePasswordNode ?: return
+        if (state.pendingArchiveExtractToFolder) {
+            extractArchive(paneId, archiveNode, password)
+        } else {
+            mountArchive(paneId, archiveNode, password)
+        }
+    }
+
+    fun dismissArchivePasswordDialog() = _uiState.update {
+        it.copy(pendingArchivePasswordNode = null, pendingArchiveExtractToFolder = false)
+    }
 
     /** Verarbeitet eingehende Dateien/Archive (Intent.ACTION_VIEW), z. B. durch Doppelklick aus einer anderen App. */
     fun handleIncomingIntentUri(uri: Uri) {
@@ -738,9 +800,16 @@ class ChromeFilesViewModel @Inject constructor(
             }
             VOLUME_STARRED -> {
                 viewModelScope.launch {
-                    nodes.filterNot { it.isStarred }.forEach { repository.toggleStarred(it) }
-                    postMessage("${nodes.size} Element(e) zu Favoriten hinzugefügt.")
+                    val toStar = nodes.filterNot { it.isStarred }
+                    if (toStar.isNotEmpty()) {
+                        toStar.forEach { repository.toggleStarred(it) }
+                    }
+                    postMessage(
+                        if (nodes.size == 1) "„${nodes.first().name}“ zu Favoriten hinzugefügt."
+                        else "${nodes.size} Elemente zu Favoriten hinzugefügt."
+                    )
                     reloadAllPanes()
+                    rebuildSidebar()
                 }
                 return true
             }
@@ -753,9 +822,14 @@ class ChromeFilesViewModel @Inject constructor(
                 return true
             }
         }
-        val movable = nodes.filterNot { File(it.parentPath).absolutePath == File(destination.path).absolutePath }
+        val cleanDest = destination.path.trimEnd('/')
+        val movable = nodes.filterNot { node ->
+            node.parentPath.trimEnd('/') == cleanDest || node.path.trimEnd('/') == cleanDest
+        }
         if (movable.isEmpty()) return false
-        val sourceVolume = movable.first().let { n -> if (n.volumeId in VIRTUAL_IDS) focused?.resolveVolumeIdForPath(n.path) else n.volumeId }
+        val sourceVolume = movable.first().let { n ->
+            if (n.volumeId in VIRTUAL_IDS) focused?.resolveVolumeIdForPath(n.path) else n.volumeId
+        }
         val isMove = sourceVolume == destination.volumeId && movable.none { it.isReadOnly }
         transfer(movable, destination, isMove)
         return true
@@ -795,7 +869,7 @@ class ChromeFilesViewModel @Inject constructor(
         }
     }
 
-    // ================================================================== Löschen, Umbenennen, Ordner, ZIP
+    // ================================================================== Löschen, Umbenennen, Ordner, ZIP / RAR
 
     /** Entf / Alt + Backspace: in den Papierkorb (im Papierkorb selbst: endgültig löschen). */
     fun trashSelection(paneId: String) {
@@ -901,6 +975,42 @@ class ChromeFilesViewModel @Inject constructor(
         }
     }
 
+    fun showCompressDialog(paneId: String) {
+        val pane = panes[paneId] ?: return
+        val selected = pane.current.selectedNodes
+        if (selected.isEmpty()) {
+            postMessage("Bitte zuerst mindestens eine Datei oder einen Ordner auswählen.")
+            return
+        }
+        if (!pane.current.isWritableLocation) {
+            postMessage("An diesem Ort kann kein Archiv erstellt werden.")
+            return
+        }
+        _uiState.update { it.copy(compressDialog = CompressDialogState(paneId, selected)) }
+    }
+
+    fun dismissCompressDialog() = _uiState.update { it.copy(compressDialog = null) }
+
+    fun confirmCompress(archiveName: String, format: ArchiveFormat, password: String?) {
+        val dialog = _uiState.value.compressDialog ?: return
+        val pane = panes[dialog.paneId] ?: return
+        _uiState.update { it.copy(compressDialog = null) }
+        viewModelScope.launch {
+            repository.compressSelectionToArchive(
+                nodes = dialog.nodes,
+                format = format,
+                destinationName = archiveName.takeIf { it.isNotBlank() },
+                password = password?.takeIf { it.isNotBlank() }?.toCharArray()
+            ).onSuccess { archive ->
+                postMessage("„${archive.name}“ wurde erstellt.")
+                pane.selectIds(setOf(archive.id))
+            }.onFailure {
+                postMessage("Komprimieren fehlgeschlagen: ${it.message}")
+            }
+            pane.reload()
+        }
+    }
+
     fun compressSelection(paneId: String, format: ArchiveFormat = ArchiveFormat.ZIP) {
         val pane = panes[paneId] ?: return
         val selected = pane.current.selectedNodes
@@ -938,6 +1048,7 @@ class ChromeFilesViewModel @Inject constructor(
             selected.filter { it.isStarred != star }.forEach { repository.toggleStarred(it) }
             postMessage(if (star) "Zu Favoriten hinzugefügt." else "Aus Favoriten entfernt.")
             reloadAllPanes()
+            rebuildSidebar()
         }
     }
 
@@ -946,6 +1057,7 @@ class ChromeFilesViewModel @Inject constructor(
             val updated = repository.toggleStarred(node)
             postMessage(if (updated.isStarred) "„${node.name}“ zu Favoriten hinzugefügt." else "„${node.name}“ aus Favoriten entfernt.")
             reloadAllPanes()
+            rebuildSidebar()
         }
     }
 
@@ -1022,6 +1134,8 @@ class ChromeFilesViewModel @Inject constructor(
 
     fun consumeUserMessage() = _uiState.update { it.copy(userMessage = null) }
 
+    fun postUserMessage(message: String) = postMessage(message)
+
     private fun postMessage(message: String) = _uiState.update { it.copy(userMessage = message) }
 
     private fun reloadAllPanes() = panes.values.forEach { it.reload() }
@@ -1035,19 +1149,24 @@ class ChromeFilesViewModel @Inject constructor(
             val showHiddenFiles = showHidden.value
             val result = mutableListOf<SidebarTreeNode>()
 
-            fun hasSubdirs(dir: File) =
-                dir.listFiles()?.any { it.isDirectory && (showHiddenFiles || !it.name.startsWith(".")) } == true
+            fun isPathExpandable(path: String): Boolean {
+                if (path.startsWith("saf://") || path.startsWith("gdrive://")) return true
+                if (path.startsWith("remote://") || path.startsWith("chromeos://")) return false
+                val dir = File(path)
+                return dir.listFiles()?.any { it.isDirectory && (showHiddenFiles || !it.name.startsWith(".")) } == true
+            }
 
             suspend fun addDirectoryChildren(parentPath: String, volume: VfsVolume, depth: Int) {
-                repository.listSubdirectories(parentPath, showHiddenFiles).forEach { dir ->
-                    val expanded = dir.absolutePath in keys
-                    val expandable = hasSubdirs(dir)
+                if (depth > 6) return
+                repository.listSubdirectories(parentPath, volume.id, showHiddenFiles).forEach { dirNode ->
+                    val expanded = dirNode.path in keys
+                    val expandable = isPathExpandable(dirNode.path)
                     result += SidebarTreeNode(
-                        key = dir.absolutePath, title = dir.name, subtitle = null, path = dir.absolutePath,
+                        key = dirNode.path, title = dirNode.name, subtitle = null, path = dirNode.path,
                         volumeId = volume.id, volumeType = volume.type, depth = depth,
                         isExpandable = expandable, isExpanded = expanded, isEjectable = false
                     )
-                    if (expanded && expandable) addDirectoryChildren(dir.absolutePath, volume, depth + 1)
+                    if (expanded && expandable) addDirectoryChildren(dirNode.path, volume, depth + 1)
                 }
             }
 
@@ -1062,14 +1181,19 @@ class ChromeFilesViewModel @Inject constructor(
                 if (volume.children.isNotEmpty()) {
                     for (child in volume.children) {
                         val isOffline = child.id == VOLUME_DRIVE_OFFLINE
-                        val childExpandable = !isOffline && hasSubdirs(File(child.rootPath))
+                        val childVolumeId = when {
+                            isOffline -> child.id
+                            volume.id == VOLUME_STARRED -> focused?.resolveVolumeIdForPath(child.rootPath) ?: VOLUME_MY_FILES
+                            else -> volume.id
+                        }
+                        val childExpandable = !isOffline && isPathExpandable(child.rootPath)
                         val childExpanded = child.rootPath in keys && childExpandable
                         result += SidebarTreeNode(
                             key = child.rootPath, title = child.title, subtitle = null, path = child.rootPath,
-                            volumeId = if (isOffline) child.id else volume.id, volumeType = child.type, depth = 1,
+                            volumeId = childVolumeId, volumeType = child.type, depth = 1,
                             isExpandable = childExpandable, isExpanded = childExpanded, isEjectable = false
                         )
-                        if (childExpanded) addDirectoryChildren(child.rootPath, volume, 2)
+                        if (childExpanded) addDirectoryChildren(child.rootPath, volume.copy(id = childVolumeId), 2)
                     }
                 } else {
                     addDirectoryChildren(volume.rootPath, volume, 1)

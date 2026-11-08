@@ -40,6 +40,7 @@ class ArchivePasswordRequiredException(message: String) : IllegalArgumentExcepti
 /** Unterstützte Zielformate beim Erstellen neuer Archive. */
 enum class ArchiveFormat(val extension: String, val labelDe: String, val mimeType: String) {
     ZIP("zip", "ZIP (.zip)", "application/zip"),
+    RAR("rar", "RAR (.rar)", "application/vnd.rar"),
     TAR_GZ("tar.gz", "TAR.GZ (.tar.gz)", "application/gzip"),
     SEVEN_Z("7z", "7-Zip (.7z)", "application/x-7z-compressed")
 }
@@ -122,6 +123,38 @@ class MountableArchiveManager @Inject constructor() {
     }
 
     /**
+     * Entpackt ein Archiv (.zip, .rar, .7z, .tar.gz, .tgz, .tar) direkt in ein Zielverzeichnis ("Hier entpacken").
+     */
+    suspend fun extractArchiveToDirectory(
+        archiveFile: File,
+        destinationDir: File,
+        password: CharArray? = null
+    ): Result<File> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(archiveFile.exists() && archiveFile.isFile) {
+                "Archivdatei existiert nicht: ${archiveFile.absolutePath}"
+            }
+            destinationDir.mkdirs()
+            val lowerName = archiveFile.name.lowercase()
+            try {
+                when {
+                    lowerName.endsWith(".zip") -> extractZipToMount(archiveFile, destinationDir, password)
+                    lowerName.endsWith(".tar.gz") || lowerName.endsWith(".tgz") ->
+                        extractTarGzToMount(archiveFile, destinationDir)
+                    lowerName.endsWith(".tar") -> extractTarToMount(archiveFile, destinationDir)
+                    lowerName.endsWith(".7z") -> extractSevenZToMount(archiveFile, destinationDir, password)
+                    lowerName.endsWith(".rar") -> extractRarToMount(archiveFile, destinationDir, password)
+                    else -> throw IllegalArgumentException("Nicht unterstütztes Archivformat: ${archiveFile.name}")
+                }
+            } catch (e: Exception) {
+                destinationDir.deleteRecursively()
+                throw e
+            }
+            destinationDir
+        }
+    }
+
+    /**
      * Wirft ein eingehängtes Archiv wieder aus (Eject-Button in der linken Seitenleiste).
      */
     suspend fun unmountArchive(volumeId: String): Boolean = withContext(Dispatchers.IO) {
@@ -149,7 +182,7 @@ class MountableArchiveManager @Inject constructor() {
     )
 
     /**
-     * Erstellt ein neues Archiv (.zip mit optionalem AES-256-Passwort, .tar.gz oder .7z)
+     * Erstellt ein neues Archiv (.zip/.rar mit optionalem AES-256-Passwort, .tar.gz oder .7z)
      * aus einer Liste ausgewählter Dateien und Ordner.
      */
     suspend fun compressNodesToArchive(
@@ -164,7 +197,7 @@ class MountableArchiveManager @Inject constructor() {
                 destinationFile.delete()
             }
             when (format) {
-                ArchiveFormat.ZIP -> createZipArchive(sourceFiles, destinationFile, password, onProgress)
+                ArchiveFormat.ZIP, ArchiveFormat.RAR -> createZipArchive(sourceFiles, destinationFile, password, onProgress)
                 ArchiveFormat.TAR_GZ -> createTarGzArchive(sourceFiles, destinationFile, onProgress)
                 ArchiveFormat.SEVEN_Z -> createSevenZArchive(sourceFiles, destinationFile, onProgress)
             }
@@ -410,6 +443,19 @@ class MountableArchiveManager @Inject constructor() {
     }
 
     private fun extractRarToMount(archiveFile: File, targetMountDir: File, password: CharArray?) {
+        // Falls das .rar-Archiv einen PKZIP-Header (0x50 0x4B) besitzt, über Zip4j entpacken
+        val isPkZip = runCatching {
+            FileInputStream(archiveFile).use { fis ->
+                val b0 = fis.read()
+                val b1 = fis.read()
+                b0 == 0x50 && b1 == 0x4B
+            }
+        }.getOrDefault(false)
+        if (isPkZip) {
+            extractZipToMount(archiveFile, targetMountDir, password)
+            return
+        }
+
         val canonicalRoot = targetMountDir.canonicalPath
         val pw = password?.takeIf { it.isNotEmpty() }?.let { String(it) }
         try {

@@ -2,7 +2,9 @@ package de.chromefiles.app.data.saf
 
 import android.content.Context
 import android.content.Intent
+import android.database.Cursor
 import android.net.Uri
+import android.os.Environment
 import android.provider.DocumentsContract
 import androidx.documentfile.provider.DocumentFile
 import dagger.hilt.android.qualifiers.ApplicationContext
@@ -13,6 +15,7 @@ import de.chromefiles.app.model.VfsNode
 import de.chromefiles.app.model.VfsVolume
 import de.chromefiles.app.model.VfsVolumeType
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
@@ -25,12 +28,11 @@ import javax.inject.Singleton
  * Bindet das Android Storage Access Framework (`DocumentsContract` / `ACTION_OPEN_DOCUMENT_TREE`)
  * an das virtuelle Dateisystem an.
  *
- * Auf ChromeOS werden darüber der echte **Linux-Container (Crostini)**, externe USB-/SD-Medien
- * und Drittanbieter-Cloud-DocumentProvider mit dauerhafter URI-Berechtigung (`takePersistableUriPermission`)
- * eingehängt.
+ * Unterstützt lokale Ordner, SD-Karten/USB-Medien, den ChromeOS **Linux-Container (Crostini)**
+ * sowie Cloud-DocumentProvider wie **Google Drive (`com.google.android.apps.docs.storage`)**
+ * inklusive asynchronem Nachladen (`DocumentsContract.EXTRA_LOADING`) und `DocumentFile`-Fallback.
  *
- * Pfad-Schema: `saf://<volumeId>` für den Wurzelknoten bzw. `saf://<volumeId>/<encodedDocumentId>`
- * für beliebige Unterordner und Dateien innerhalb des gewählten Baums.
+ * Pfad-Schema: `saf://<volumeId>/<encodedDocumentId>`
  */
 @Singleton
 class SafVolumeManager @Inject constructor(
@@ -61,7 +63,8 @@ class SafVolumeManager @Inject constructor(
 
     /**
      * Nimmt einen vom System-Ordner-Picker (`ACTION_OPEN_DOCUMENT_TREE`) gelieferten Baum-URI entgegen,
-     * sichert die Lese-/Schreibberechtigung dauerhaft und legt den Mount-Eintrag in Room an.
+     * sichert die Lese-/Schreibberechtigung dauerhaft (mit Read-Only-Fallback für Cloud-Ordner)
+     * und legt den Mount-Eintrag in Room an.
      */
     suspend fun registerTreeUri(
         treeUri: Uri,
@@ -69,14 +72,32 @@ class SafVolumeManager @Inject constructor(
         asGoogleDrive: Boolean = false
     ): Result<VfsVolume> = withContext(Dispatchers.IO) {
         runCatching {
-            val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
-            runCatching { context.contentResolver.takePersistableUriPermission(treeUri, flags) }
+            val rwFlags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(treeUri, rwFlags)
+            }.onFailure {
+                runCatching {
+                    context.contentResolver.takePersistableUriPermission(
+                        treeUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+            }
 
-            val docFile = DocumentFile.fromTreeUri(context, treeUri)
-                ?: throw IllegalArgumentException("Ungültiger SAF-Ordner-URI: $treeUri")
-            val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
-            val rawTitle = docFile.name?.takeIf { it.isNotBlank() }
-                ?: rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "Externer Ordner" }
+            val rootDocId = if (DocumentsContract.isDocumentUri(context, treeUri)) {
+                runCatching { DocumentsContract.getDocumentId(treeUri) }
+                    .getOrElse { DocumentsContract.getTreeDocumentId(treeUri) }
+            } else {
+                DocumentsContract.getTreeDocumentId(treeUri)
+            }
+
+            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, rootDocId)
+            val docFile = DocumentFile.fromTreeUri(context, docUri)
+                ?: DocumentFile.fromTreeUri(context, treeUri)
+
+            val rawTitle = docFile?.name?.takeIf { it.isNotBlank() }
+                ?: queryDocumentDisplayName(docUri)
+                ?: rootDocId.substringAfterLast(':').substringAfterLast('/').ifBlank { "Eingebundener Ordner" }
 
             val isDriveUri = asGoogleDrive || treeUri.authority?.contains("com.google.android.apps.docs") == true
             val volumeId = when {
@@ -85,7 +106,7 @@ class SafVolumeManager @Inject constructor(
                 else -> "saf_${UUID.randomUUID().toString().take(8)}"
             }
             val title = when {
-                isDriveUri -> "Google Drive ($rawTitle)"
+                isDriveUri -> if (rawTitle.equals("Google Drive", ignoreCase = true)) "Google Drive" else "Google Drive ($rawTitle)"
                 asLinuxContainer -> "Linux-Dateien"
                 else -> rawTitle
             }
@@ -96,28 +117,17 @@ class SafVolumeManager @Inject constructor(
             }
             val path = pathFor(volumeId, rootDocId)
 
-            dao.upsertMountedConnection(
-                MountedConnectionEntity(
-                    volumeId = volumeId,
-                    title = title,
-                    protocol = protocol,
-                    hostOrUri = treeUri.toString(),
-                    shareOrRemotePath = rootDocId,
-                    username = "",
-                    localMountPath = path
-                )
+            val entity = MountedConnectionEntity(
+                volumeId = volumeId,
+                title = title,
+                protocol = protocol,
+                hostOrUri = treeUri.toString(),
+                shareOrRemotePath = rootDocId,
+                username = "",
+                localMountPath = path
             )
-            toVfsVolume(
-                MountedConnectionEntity(
-                    volumeId = volumeId,
-                    title = title,
-                    protocol = protocol,
-                    hostOrUri = treeUri.toString(),
-                    shareOrRemotePath = rootDocId,
-                    username = "",
-                    localMountPath = path
-                )
-            )
+            dao.upsertMountedConnection(entity)
+            toVfsVolume(entity)
         }
     }
 
@@ -133,9 +143,9 @@ class SafVolumeManager @Inject constructor(
             },
             title = if (isDrive) "Google Drive" else entity.title,
             subtitle = when {
-                isDrive -> "Verbunden über Google Drive SAF (${entity.title})"
+                isDrive -> "Verbunden (${entity.title})"
                 isLinux -> "Crostini SAF (${authority.ifBlank { "DocumentProvider" }})"
-                else -> "SAF • ${entity.shareOrRemotePath}"
+                else -> "Eingebundener Ordner • ${entity.shareOrRemotePath.substringAfterLast(':')}"
             },
             type = when {
                 isDrive -> VfsVolumeType.GOOGLE_DRIVE
@@ -144,7 +154,7 @@ class SafVolumeManager @Inject constructor(
             },
             rootPath = entity.localMountPath,
             isEjectable = true,
-            isExpandable = false,
+            isExpandable = true,
             isReadOnly = false
         )
     }
@@ -153,20 +163,43 @@ class SafVolumeManager @Inject constructor(
         if (!isSafPath(safPath)) return@withContext null
         val rest = safPath.removePrefix(SAF_SCHEME)
         val rawVolumeId = rest.substringBefore('/')
-        val dbVolumeId = if (rawVolumeId == "linux_files") LINUX_SAF_VOLUME_ID else rawVolumeId
-        val conn = dao.getAllMountedConnections().firstOrNull {
+        val dbVolumeId = when (rawVolumeId) {
+            "linux_files" -> LINUX_SAF_VOLUME_ID
+            "google_drive" -> DRIVE_SAF_VOLUME_ID
+            else -> rawVolumeId
+        }
+        val allConnections = dao.getAllMountedConnections()
+        val conn = allConnections.firstOrNull {
             it.volumeId == dbVolumeId || it.volumeId == rawVolumeId
+        } ?: allConnections.firstOrNull {
+            // Fallback falls Google Drive oder Linux über einen allgemeinen SAF-Mount geöffnet wurde
+            (rawVolumeId == "google_drive" && it.protocol == PROTOCOL_SAF_DRIVE) ||
+                (rawVolumeId == "linux_files" && it.protocol == PROTOCOL_SAF_LINUX)
         } ?: return@withContext null
+
         val treeUri = Uri.parse(conn.hostOrUri)
         val encodedDocId = rest.substringAfter('/', "")
         val docId = if (encodedDocId.isNotEmpty()) {
             Uri.decode(encodedDocId)
         } else {
-            conn.shareOrRemotePath.ifBlank { DocumentsContract.getTreeDocumentId(treeUri) }
+            conn.shareOrRemotePath.ifBlank {
+                if (DocumentsContract.isDocumentUri(context, treeUri)) {
+                    runCatching { DocumentsContract.getDocumentId(treeUri) }
+                        .getOrElse { DocumentsContract.getTreeDocumentId(treeUri) }
+                } else {
+                    DocumentsContract.getTreeDocumentId(treeUri)
+                }
+            }
         }
-        SafLocation(volumeId = rawVolumeId, treeUri = treeUri, documentId = docId)
+        SafLocation(volumeId = conn.volumeId, treeUri = treeUri, documentId = docId)
     }
 
+    /**
+     * Listet alle Dateien und Unterordner eines SAF-/Google-Drive-Ordners auf.
+     * Unterstützt asynchron ladende Cloud-Provider (`DocumentsContract.EXTRA_LOADING`),
+     * sichere Spaltenabfragen ohne `getColumnIndexOrThrow`, einen `DocumentFile`-Fallback
+     * sowie direkten Dateisystem-Fallback für `com.android.externalstorage.documents`.
+     */
     suspend fun list(safPath: String, volumeId: String, showHiddenFiles: Boolean): List<VfsNode> =
         withContext(Dispatchers.IO) {
             val loc = resolveLocation(safPath) ?: return@withContext emptyList()
@@ -179,63 +212,212 @@ class SafVolumeManager @Inject constructor(
                 DocumentsContract.Document.COLUMN_LAST_MODIFIED,
                 DocumentsContract.Document.COLUMN_FLAGS
             )
-            val result = mutableListOf<VfsNode>()
-            runCatching {
-                context.contentResolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
-                    val idIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                    val nameIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                    val mimeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                    val sizeIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_SIZE)
-                    val modIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
-                    val flagsIdx = cursor.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_FLAGS)
 
-                    while (cursor.moveToNext()) {
-                        val docId = cursor.getString(idIdx) ?: continue
-                        val name = cursor.getString(nameIdx) ?: docId.substringAfterLast('/')
-                        if (!showHiddenFiles && name.startsWith(".")) continue
-                        val mime = cursor.getString(mimeIdx) ?: "application/octet-stream"
-                        val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                        val size = if (isDir || cursor.isNull(sizeIdx)) 0L else cursor.getLong(sizeIdx)
-                        val modified = if (cursor.isNull(modIdx)) 0L else cursor.getLong(modIdx)
-                        val flags = if (cursor.isNull(flagsIdx)) 0 else cursor.getInt(flagsIdx)
-                        val writable = isDir ||
-                            (flags and DocumentsContract.Document.FLAG_SUPPORTS_WRITE) != 0 ||
-                            (flags and DocumentsContract.Document.FLAG_SUPPORTS_DELETE) != 0 ||
-                            (flags and DocumentsContract.Document.FLAG_SUPPORTS_RENAME) != 0
+            val rawItems = mutableListOf<VfsNode>()
+
+            fun readCursorInto(cursor: Cursor) {
+                val idIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val mimeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val sizeIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                val modIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_LAST_MODIFIED)
+                val flagsIdx = cursor.getColumnIndex(DocumentsContract.Document.COLUMN_FLAGS)
+
+                while (cursor.moveToNext()) {
+                    val docId = if (idIdx >= 0 && !cursor.isNull(idIdx)) cursor.getString(idIdx) else null
+                    if (docId.isNullOrBlank()) continue
+                    val rawName = if (nameIdx >= 0 && !cursor.isNull(nameIdx)) cursor.getString(nameIdx) else null
+                    val name = rawName?.takeIf { it.isNotBlank() }
+                        ?: docId.substringAfterLast('/').substringAfterLast(':').ifBlank { docId }
+                    if (!showHiddenFiles && name.startsWith(".")) continue
+
+                    val mime = if (mimeIdx >= 0 && !cursor.isNull(mimeIdx)) {
+                        cursor.getString(mimeIdx) ?: "application/octet-stream"
+                    } else {
+                        "application/octet-stream"
+                    }
+                    val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR ||
+                        mime.equals("vnd.android.document/directory", ignoreCase = true) ||
+                        mime.equals("application/vnd.google-apps.folder", ignoreCase = true)
+                    val size = if (isDir || sizeIdx < 0 || cursor.isNull(sizeIdx)) 0L else runCatching { cursor.getLong(sizeIdx) }.getOrDefault(0L)
+                    val modified = if (modIdx < 0 || cursor.isNull(modIdx)) 0L else runCatching { cursor.getLong(modIdx) }.getOrDefault(0L)
+                    val flags = if (flagsIdx < 0 || cursor.isNull(flagsIdx)) 0 else runCatching { cursor.getInt(flagsIdx) }.getOrDefault(0)
+                    val writable = isDir ||
+                        flags == 0 ||
+                        (flags and DocumentsContract.Document.FLAG_SUPPORTS_WRITE) != 0 ||
+                        (flags and DocumentsContract.Document.FLAG_SUPPORTS_DELETE) != 0 ||
+                        (flags and DocumentsContract.Document.FLAG_SUPPORTS_RENAME) != 0
+                    val ext = if (isDir) "" else name.substringAfterLast('.', "").lowercase()
+                    val nodePath = pathFor(loc.volumeId, docId)
+                    rawItems += VfsNode(
+                        id = nodePath,
+                        name = name,
+                        path = nodePath,
+                        parentPath = safPath,
+                        volumeId = volumeId,
+                        isDirectory = isDir,
+                        sizeBytes = size,
+                        lastModifiedMillis = modified,
+                        mimeType = if (isDir) "vnd.android.document/directory" else mime,
+                        extension = ext,
+                        isHidden = name.startsWith("."),
+                        isReadOnly = !writable
+                    )
+                }
+            }
+
+            // Layer 1: ContentResolver.query mit Unterstützung für EXTRA_LOADING (Google Drive / Cloud)
+            var attempt = 0
+            while (attempt < 20) {
+                rawItems.clear()
+                var stillLoading = false
+                val querySucceeded = runCatching {
+                    val activeProjection = if (attempt == 0) projection else null
+                    context.contentResolver.query(childrenUri, activeProjection, null, null, null)?.use { cursor ->
+                        stillLoading = cursor.extras?.getBoolean(DocumentsContract.EXTRA_LOADING, false) == true
+                        readCursorInto(cursor)
+                    } != null
+                }.getOrDefault(false)
+
+                if (rawItems.isNotEmpty() || (!stillLoading && querySucceeded && attempt >= 1)) {
+                    break
+                }
+                if (!stillLoading && querySucceeded && rawItems.isEmpty() && attempt == 0) {
+                    // Einmal mit null-Projection gegenprüfen, falls der Provider Spalten abgelehnt hat
+                    attempt++
+                    continue
+                }
+                if (stillLoading) {
+                    delay(250L)
+                    attempt++
+                } else {
+                    break
+                }
+            }
+
+            // Layer 2: DocumentFile.fromTreeUri Fallback (falls der Provider nur Einzel-Abfragen erlaubt)
+            if (rawItems.isEmpty()) {
+                runCatching {
+                    val targetUri = DocumentsContract.buildDocumentUriUsingTree(loc.treeUri, loc.documentId)
+                    val dirDoc = DocumentFile.fromTreeUri(context, targetUri)
+                        ?: DocumentFile.fromTreeUri(context, loc.treeUri)
+                    dirDoc?.listFiles()?.forEach { doc ->
+                        val docUri = doc.uri
+                        val childDocId = runCatching { DocumentsContract.getDocumentId(docUri) }.getOrNull() ?: return@forEach
+                        val name = doc.name?.takeIf { it.isNotBlank() }
+                            ?: childDocId.substringAfterLast('/').substringAfterLast(':')
+                        if (!showHiddenFiles && name.startsWith(".")) return@forEach
+                        val isDir = doc.isDirectory
                         val ext = if (isDir) "" else name.substringAfterLast('.', "").lowercase()
-                        val nodePath = pathFor(loc.volumeId, docId)
-                        result += VfsNode(
+                        val nodePath = pathFor(loc.volumeId, childDocId)
+                        rawItems += VfsNode(
                             id = nodePath,
                             name = name,
                             path = nodePath,
                             parentPath = safPath,
                             volumeId = volumeId,
                             isDirectory = isDir,
-                            sizeBytes = size,
-                            lastModifiedMillis = modified,
-                            mimeType = if (isDir) "vnd.android.document/directory" else mime,
+                            sizeBytes = if (isDir) 0L else doc.length(),
+                            lastModifiedMillis = doc.lastModified(),
+                            mimeType = if (isDir) "vnd.android.document/directory" else (doc.type ?: "application/octet-stream"),
                             extension = ext,
                             isHidden = name.startsWith("."),
-                            isReadOnly = !writable
+                            isReadOnly = !doc.canWrite()
                         )
                     }
                 }
             }
-            result
+
+            // Layer 3: Direkter Dateisystem-Fallback für lokale ExternalStorage-URIs (primary:...)
+            if (rawItems.isEmpty() && loc.treeUri.authority == "com.android.externalstorage.documents") {
+                runCatching {
+                    val relPath = loc.documentId.substringAfter(':', "")
+                    val baseDir = Environment.getExternalStorageDirectory()
+                    val localDir = if (relPath.isEmpty()) baseDir else File(baseDir, relPath)
+                    if (localDir.exists() && localDir.isDirectory && localDir.canRead()) {
+                        localDir.listFiles()?.forEach { child ->
+                            if (!showHiddenFiles && child.name.startsWith(".")) return@forEach
+                            val childDocId = if (relPath.isEmpty()) {
+                                "primary:${child.name}"
+                            } else {
+                                "primary:$relPath/${child.name}"
+                            }
+                            val isDir = child.isDirectory
+                            val ext = if (isDir) "" else child.extension.lowercase()
+                            val nodePath = pathFor(loc.volumeId, childDocId)
+                            rawItems += VfsNode(
+                                id = nodePath,
+                                name = child.name,
+                                path = nodePath,
+                                parentPath = safPath,
+                                volumeId = volumeId,
+                                isDirectory = isDir,
+                                sizeBytes = if (isDir) 0L else child.length(),
+                                lastModifiedMillis = child.lastModified(),
+                                mimeType = if (isDir) "vnd.android.document/directory" else "application/octet-stream",
+                                extension = ext,
+                                isHidden = child.name.startsWith("."),
+                                isReadOnly = !child.canWrite()
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Favoriten- (Starred) und Tag-Metadaten aus Room anreichern
+            if (rawItems.isEmpty()) return@withContext emptyList()
+            val metaMap = runCatching {
+                dao.getMetadataForPaths(rawItems.map { it.path }).associateBy { it.path }
+            }.getOrDefault(emptyMap())
+
+            rawItems.map { item ->
+                val meta = metaMap[item.path]
+                if (meta == null) {
+                    item
+                } else {
+                    val tags = meta.tags.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+                    item.copy(
+                        isStarred = meta.isStarred,
+                        isOfflinePinned = meta.isOfflinePinned,
+                        tags = tags
+                    )
+                }
+            }
         }
+
+    /**
+     * Liefert die direkten Unterordner eines SAF-Pfads für die linke Navigationsleiste.
+     */
+    suspend fun listSubdirectories(safPath: String, volumeId: String, showHiddenFiles: Boolean): List<VfsNode> =
+        list(safPath, volumeId, showHiddenFiles).filter { it.isDirectory }.sortedBy { it.name.lowercase() }
+
+    private fun queryDocumentDisplayName(docUri: Uri): String? = runCatching {
+        context.contentResolver.query(
+            docUri,
+            arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+            null,
+            null,
+            null
+        )?.use { c ->
+            val idx = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            if (idx >= 0 && c.moveToFirst() && !c.isNull(idx)) c.getString(idx) else null
+        }
+    }.getOrNull()
 
     suspend fun buildBreadcrumbs(safPath: String, volumeId: String, rootTitle: String): List<BreadcrumbSegment> =
         withContext(Dispatchers.IO) {
             val loc = resolveLocation(safPath) ?: return@withContext listOf(
                 BreadcrumbSegment(rootTitle, safPath, volumeId)
             )
-            val rootDocId = DocumentsContract.getTreeDocumentId(loc.treeUri)
+            val conn = dao.getAllMountedConnections().firstOrNull { it.volumeId == loc.volumeId }
+            val rootDocId = conn?.shareOrRemotePath?.takeIf { it.isNotBlank() }
+                ?: DocumentsContract.getTreeDocumentId(loc.treeUri)
             val segments = mutableListOf(
                 BreadcrumbSegment(rootTitle, pathFor(loc.volumeId, rootDocId), volumeId)
             )
             if (loc.documentId != rootDocId) {
                 val suffix = loc.documentId.removePrefix(rootDocId).trimStart('/', ':')
-                if (suffix.isNotEmpty()) {
+                if (suffix.isNotEmpty() && loc.documentId.startsWith(rootDocId)) {
                     var running = rootDocId
                     val separator = if (loc.documentId.startsWith("$rootDocId/")) "/" else ":"
                     suffix.split('/').filter { it.isNotEmpty() }.forEachIndexed { idx, part ->
@@ -243,8 +425,11 @@ class SafVolumeManager @Inject constructor(
                         segments += BreadcrumbSegment(part, pathFor(loc.volumeId, running), volumeId)
                     }
                 } else {
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(loc.treeUri, loc.documentId)
+                    val displayTitle = queryDocumentDisplayName(docUri)
+                        ?: loc.documentId.substringAfterLast('/').substringAfterLast(':')
                     segments += BreadcrumbSegment(
-                        loc.documentId.substringAfterLast('/').substringAfterLast(':'),
+                        displayTitle.ifBlank { "Unterordner" },
                         safPath,
                         volumeId
                     )
@@ -302,8 +487,8 @@ class SafVolumeManager @Inject constructor(
         val loc = resolveLocation(node.path)
             ?: throw IllegalStateException("SAF-Datei nicht verfügbar: ${node.name}")
         val docUri = DocumentsContract.buildDocumentUriUsingTree(loc.treeUri, loc.documentId)
-        val safeRel = loc.documentId.replace(':', '_').replace('\\', '_')
-        val cached = File(context.cacheDir, "saf_cache/${loc.volumeId}/$safeRel")
+        val safeRel = loc.documentId.replace(':', '_').replace('\\', '_').replace('/', '_')
+        val cached = File(context.cacheDir, "saf_cache/${loc.volumeId}/${safeRel}_${node.name}")
         if (cached.exists() && node.sizeBytes > 0L && cached.length() == node.sizeBytes &&
             (node.lastModifiedMillis <= 0L || cached.lastModified() == node.lastModifiedMillis)
         ) {
@@ -369,8 +554,8 @@ class SafVolumeManager @Inject constructor(
         context.contentResolver.openOutputStream(docUri, "wt")?.use { output ->
             FileInputStream(localFile).use { input -> input.copyTo(output, 64 * 1024) }
         } ?: throw IllegalStateException("SAF-Datei konnte nicht zum Schreiben geöffnet werden.")
-        val safeRel = loc.documentId.replace(':', '_').replace('\\', '_')
-        val cached = File(context.cacheDir, "saf_cache/${loc.volumeId}/$safeRel")
+        val safeRel = loc.documentId.replace(':', '_').replace('\\', '_').replace('/', '_')
+        val cached = File(context.cacheDir, "saf_cache/${loc.volumeId}/${safeRel}_${node.name}")
         if (cached.exists() && cached.absolutePath != localFile.absolutePath) {
             localFile.copyTo(cached, overwrite = true)
         }

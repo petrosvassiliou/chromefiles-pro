@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Folder Back Tab (Warm Amber Gold) -->
+    <path
+        android:pathData="M26,35 C26,31.686 28.686,29 32,29 L46.5,29 C48.4,29 50.18,29.9 51.3,31.4 L54.2,35.2 C54.76,35.95 55.65,36.4 56.6,36.4 L76,36.4 C79.314,36.4 82,39.086 82,42.4 L82,71 C82,74.314 79.314,77 76,77 L32,77 C28.686,77 26,74.314 26,71 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="26"
+                android:startY="29"
+                android:endX="82"
+                android:endY="77"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFFDD663" />
+                <item android:offset="1.0" android:color="#FFF29900" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Document Card 1 Peeking Out (Sky Blue) -->
+    <path
+        android:fillColor="#FFD2E3FC"
+        android:pathData="M34,37 C34,35.343 35.343,34 37,34 L67,34 C68.657,34 70,35.343 70,37 L70,56 L34,56 Z" />
+
+    <!-- Document Card 2 Peeking Out (Crisp White) -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M38,40.5 C38,38.843 39.343,37.5 41,37.5 L71,37.5 C72.657,37.5 74,38.843 74,40.5 L74,58 L38,58 Z" />
+
+    <!-- Document Lines on White Card -->
+    <path
+        android:fillColor="#FF8AB4F8"
+        android:pathData="M43,42.5 h18 a1.2,1.2 0 0 1 0,2.4 h-18 a1.2,1.2 0 0 1 0,-2.4 z" />
+    <path
+        android:fillColor="#FFAECBFA"
+        android:pathData="M43,46.8 h12 a1.2,1.2 0 0 1 0,2.4 h-12 a1.2,1.2 0 0 1 0,-2.4 z" />
+
+    <!-- Folder Front Pocket (Rich Golden Yellow) -->
+    <path
+        android:pathData="M25,47 C25,44.239 27.239,42 30,42 L78,42 C80.761,42 83,44.239 83,47 L81.2,72.5 C80.98,75.04 78.85,77 76.3,77 L31.7,77 C29.15,77 27.02,75.04 26.8,72.5 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:startX="54"
+                android:startY="42"
+                android:endX="54"
+                android:endY="77"
+                android:type="linear">
+                <item android:offset="0.0" android:color="#FFFFE082" />
+                <item android:offset="0.35" android:color="#FFFBBC04" />
+                <item android:offset="1.0" android:color="#FFEA8600" />
+            </gradient>
+        </aapt:attr>
+    </path>
+
+    <!-- Top Highlight Rim on Folder Front -->
+    <path
+        android:fillColor="#55FFFFFF"
+        android:pathData="M30,42 L78,42 C80.2,42 82.1,43.4 82.7,45.4 L25.3,45.4 C25.9,43.4 27.8,42 30,42 Z" />
+
+    <!-- Pro Badge / Star Accent on Front Right -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M68,53.5 L70.0,57.8 L74.7,58.4 L71.2,61.6 L72.1,66.3 L68,63.9 L63.9,66.3 L64.8,61.6 L61.3,58.4 L66.0,57.8 Z" />
+</vector>

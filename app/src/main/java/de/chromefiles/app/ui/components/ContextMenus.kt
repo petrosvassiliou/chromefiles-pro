@@ -86,6 +86,20 @@ private fun NodeMenuItems(
     val multi = selection.size > 1
     val editable = !pane.isTrash && selection.none { it.isReadOnly }
 
+    DropdownMenuItem(
+        text = {
+            Text(
+                text = if (multi) "${selection.size} Elemente ausgewählt" else target.name,
+                style = MaterialTheme.typography.labelLarge,
+                color = MaterialTheme.colorScheme.primary,
+                maxLines = 1
+            )
+        },
+        enabled = false,
+        onClick = {}
+    )
+    HorizontalDivider()
+
     if (pane.isTrash) {
         MenuEntry("Wiederherstellen", Icons.Outlined.RestoreFromTrash, onClick = act { vm.restoreSelectionFromTrash(paneId) })
         MenuEntry("Endgültig löschen", Icons.Outlined.DeleteForever, "Umschalt + Entf", onClick = act { vm.requestPermanentDelete(paneId) })
@@ -107,8 +121,25 @@ private fun NodeMenuItems(
     if (target.isDirectory && !multi) {
         MenuEntry("In neuem Tab öffnen", Icons.Outlined.Tab, onClick = act { vm.openInNewTab(paneId, target) })
     }
+    val allStarred = selection.all { it.isStarred }
+    MenuEntry(
+        if (allStarred) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen",
+        if (allStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
+        onClick = act { vm.toggleStarredSelection(paneId) }
+    )
     if (target.isArchive && !multi) {
-        MenuEntry("Als Laufwerk einhängen", Icons.Outlined.Unarchive, onClick = act { vm.mountArchive(paneId, target) })
+        HorizontalDivider()
+        MenuEntry(
+            "Hier entpacken",
+            Icons.Outlined.Unarchive,
+            enabled = pane.isWritableLocation,
+            onClick = act { vm.extractArchive(paneId, target) }
+        )
+        MenuEntry(
+            "Als Laufwerk einhängen",
+            Icons.Outlined.FolderOpen,
+            onClick = act { vm.mountArchive(paneId, target) }
+        )
     }
     HorizontalDivider()
     MenuEntry("Ausschneiden", Icons.Outlined.ContentCut, "Strg + X", enabled = editable, onClick = act { vm.copySelection(paneId, isCut = true) })
@@ -130,16 +161,22 @@ private fun NodeMenuItems(
         onClick = act { vm.startRename(paneId) }
     )
     MenuEntry(
-        if (multi) "Auswahl zippen (.zip)" else "ZIP-Archiv erstellen (.zip)",
+        "Komprimieren … (ZIP / RAR / 7Z / TAR.GZ)",
+        Icons.Outlined.Archive,
+        enabled = pane.isWritableLocation,
+        onClick = act { vm.showCompressDialog(paneId) }
+    )
+    MenuEntry(
+        if (multi) "Als .zip komprimieren" else "ZIP-Archiv erstellen (.zip)",
         Icons.Outlined.Archive,
         enabled = pane.isWritableLocation,
         onClick = act { vm.compressSelection(paneId, ArchiveFormat.ZIP) }
     )
     MenuEntry(
-        "TAR.GZ-Archiv erstellen (.tar.gz)",
+        if (multi) "Als .rar komprimieren" else "RAR-Archiv erstellen (.rar)",
         Icons.Outlined.Archive,
         enabled = pane.isWritableLocation,
-        onClick = act { vm.compressSelection(paneId, ArchiveFormat.TAR_GZ) }
+        onClick = act { vm.compressSelection(paneId, ArchiveFormat.RAR) }
     )
     MenuEntry(
         "7z-Archiv erstellen (.7z)",
@@ -147,11 +184,11 @@ private fun NodeMenuItems(
         enabled = pane.isWritableLocation,
         onClick = act { vm.compressSelection(paneId, ArchiveFormat.SEVEN_Z) }
     )
-    val allStarred = selection.all { it.isStarred }
     MenuEntry(
-        if (allStarred) "Aus Favoriten entfernen" else "Zu Favoriten hinzufügen",
-        if (allStarred) Icons.Filled.Star else Icons.Outlined.StarOutline,
-        onClick = act { vm.toggleStarredSelection(paneId) }
+        "TAR.GZ-Archiv erstellen (.tar.gz)",
+        Icons.Outlined.Archive,
+        enabled = pane.isWritableLocation,
+        onClick = act { vm.compressSelection(paneId, ArchiveFormat.TAR_GZ) }
     )
     if (!target.isDirectory && !multi && (target.volumeId == VOLUME_DRIVE || target.isOfflinePinned)) {
         MenuEntry(

@@ -32,24 +32,33 @@ import de.chromefiles.app.ui.viewmodel.ChromeFilesViewModel
 import de.chromefiles.app.ui.viewmodel.DropDestination
 import java.io.File
 
-/** Lokaler Zustand eines Drags innerhalb von ChromeFiles Pro (nur in derselben Activity sichtbar). */
+/** Lokaler Zustand eines Drags innerhalb von Files Pro (nur in derselben Activity sichtbar). */
 class InternalDragPayload(val nodes: List<VfsNode>)
 
+/**
+ * Reaktiver Drag-Zustand für die Quick-Drop-Leiste (Favoriten / Übergeordneter Ordner / Papierkorb)
+ * sowie als zuverlässiger Fallback innerhalb der App.
+ */
+object ActiveDragState {
+    var nodes by mutableStateOf<List<VfsNode>>(emptyList())
+}
+
 sealed interface DropPayload {
-    /** Elemente aus ChromeFiles Pro selbst (beliebiger Tab / Pane). */
+    /** Elemente aus Files Pro selbst (beliebiger Tab / Pane). */
     data class Internal(val nodes: List<VfsNode>) : DropPayload
 
     /** content://-URIs aus einer anderen App, z. B. der ChromeOS Files App. */
     class External(val uris: List<Uri>, val permissions: DragAndDropPermissions?) : DropPayload
 }
 
-private const val DRAG_LABEL = "ChromeFilesPro-Drag"
+private const val DRAG_LABEL = "FilesPro-Drag"
 
 /**
  * Baut die Drag-Daten: content://-URIs (FileProvider) für andere Apps + lokaler Payload für interne Ziele.
  */
 fun buildDragTransferData(context: Context, nodes: List<VfsNode>): DragAndDropTransferData {
-    val uris = nodes.filterNot { it.isDirectory }.mapNotNull { node ->
+    ActiveDragState.nodes = nodes
+    val uris = nodes.filterNot { it.isDirectory || it.isSaf || it.isGoogleDriveApi || it.isRemote }.mapNotNull { node ->
         runCatching {
             FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(node.path))
         }.getOrNull()
@@ -61,10 +70,15 @@ fun buildDragTransferData(context: Context, nodes: List<VfsNode>): DragAndDropTr
             uris.drop(1).forEach { addItem(ClipData.Item(it)) }
         }
     }
+    val flags = if (uris.isEmpty()) {
+        View.DRAG_FLAG_GLOBAL
+    } else {
+        View.DRAG_FLAG_GLOBAL or View.DRAG_FLAG_GLOBAL_URI_READ
+    }
     return DragAndDropTransferData(
         clipData = clip,
         localState = InternalDragPayload(nodes),
-        flags = View.DRAG_FLAG_GLOBAL or View.DRAG_FLAG_GLOBAL_URI_READ
+        flags = flags
     )
 }
 
@@ -96,11 +110,14 @@ fun Modifier.fileDropTarget(
         object : DragAndDropTarget {
             override fun onDrop(event: DragAndDropEvent): Boolean {
                 hovering = false
+                val activeNodes = ActiveDragState.nodes
+                ActiveDragState.nodes = emptyList()
                 if (!currentEnabled) return false
                 val dragEvent = event.toAndroidDragEvent()
-                val local = dragEvent.localState as? InternalDragPayload
+                val local = (dragEvent.localState as? InternalDragPayload)?.nodes
+                    ?: activeNodes.takeIf { it.isNotEmpty() }
                 val payload: DropPayload = if (local != null) {
-                    DropPayload.Internal(local.nodes)
+                    DropPayload.Internal(local)
                 } else {
                     val clip = dragEvent.clipData ?: return false
                     val uris = (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
@@ -120,6 +137,7 @@ fun Modifier.fileDropTarget(
 
             override fun onEnded(event: DragAndDropEvent) {
                 hovering = false
+                ActiveDragState.nodes = emptyList()
             }
         }
     }

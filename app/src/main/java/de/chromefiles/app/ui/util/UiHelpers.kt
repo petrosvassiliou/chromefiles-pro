@@ -52,10 +52,12 @@ import androidx.compose.ui.draganddrop.DragAndDropTransferData
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.remember
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.isMetaPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
+import androidx.compose.ui.platform.LocalHapticFeedback
 import de.chromefiles.app.model.VfsNode
 import de.chromefiles.app.model.VfsVolumeType
 import de.chromefiles.app.ui.viewmodel.SidebarTreeNode
@@ -160,18 +162,22 @@ fun SidebarTreeNode.icon(): ImageVector {
 }
 
 /**
- * Desktop-Gesten für Datei-Elemente (Listenzeile / Kachel):
+ * Desktop- & Touch-Gesten für Datei-Elemente (Listenzeile / Kachel):
  * - Maus links: Klick mit Strg/Meta- und Umschalt-Modifikatoren, Doppelklick, Ziehen startet natives Drag & Drop
  *   (funktioniert auch app-übergreifend, z. B. in die ChromeOS Files App oder Chrome).
- * - Maus rechts bzw. Zwei-Finger-Tipp auf dem Trackpad: Kontextmenü.
- * - Touch: Tippen = Klick, Doppeltippen = Öffnen, langes Drücken = Kontextmenü.
+ * - Maus rechts bzw. Zwei-Finger-Tipp auf dem Trackpad: Kontextmenü (wird beim Loslassen geöffnet, damit
+ *   das PopupWindow nicht durch das Mouse-Up-Event sofort wieder geschlossen wird).
+ * - Touch:
+ *   - Tippen = Klick / Öffnen, Doppeltippen = Öffnen
+ *   - Langes Drücken + Ziehen = Natives Drag & Drop starten (für Dateioperationen & Favoriten)
+ *   - Langes Drücken ohne Ziehen = Kontextmenü öffnen + Haptisches Feedback
  * Ist [enabled] false (z. B. beim Inline-Umbenennen), werden alle Gesten an Kinder durchgereicht.
  */
 @Composable
 fun Modifier.fileItemGestures(
     key: Any?,
     enabled: Boolean,
-    onClick: (ctrl: Boolean, shift: Boolean) -> Unit,
+    onClick: (ctrl: Boolean, shift: Boolean, isTouch: Boolean) -> Unit,
     onDoubleClick: () -> Unit,
     onContextMenu: () -> Unit,
     onPrepareDrag: () -> DragAndDropTransferData?,
@@ -182,9 +188,10 @@ fun Modifier.fileItemGestures(
     val currentOnDoubleClick by rememberUpdatedState(onDoubleClick)
     val currentOnContextMenu by rememberUpdatedState(onContextMenu)
     val currentOnPrepareDrag by rememberUpdatedState(onPrepareDrag)
+    val haptics = LocalHapticFeedback.current
     val lastClickUptime = remember(key) { LongArray(1) }
 
-    fun handleClick(uptime: Long, mods: PointerKeyboardModifiers) {
+    fun handleClick(uptime: Long, mods: PointerKeyboardModifiers, isTouch: Boolean) {
         val ctrl = mods.isCtrlPressed || mods.isMetaPressed
         val shift = mods.isShiftPressed
         val isDouble = !ctrl && !shift && uptime - lastClickUptime[0] < DOUBLE_CLICK_TIMEOUT_MS
@@ -193,7 +200,7 @@ fun Modifier.fileItemGestures(
             currentOnDoubleClick()
         } else {
             lastClickUptime[0] = uptime
-            currentOnClick(ctrl, shift)
+            currentOnClick(ctrl, shift, isTouch)
         }
     }
 
@@ -207,13 +214,21 @@ fun Modifier.fileItemGestures(
     ) {
         awaitEachGesture {
             val down = awaitFirstDown(requireUnconsumed = false)
-            if (!currentEnabled) return@awaitEachGesture
+            if (!currentEnabled || down.isConsumed) return@awaitEachGesture
             val pressEvent = currentEvent
             val mods = pressEvent.keyboardModifiers
 
             if (down.type == PointerType.Mouse) {
                 if (pressEvent.buttons.isSecondaryPressed) {
                     down.consume()
+                    // Warten bis die rechte Maustaste losgelassen wird, damit das Popup nicht sofort schließt
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        event.changes.forEach { it.consume() }
+                        if (!event.buttons.isSecondaryPressed && event.changes.none { it.pressed }) {
+                            break
+                        }
+                    }
                     currentOnContextMenu()
                     return@awaitEachGesture
                 }
@@ -221,9 +236,10 @@ fun Modifier.fileItemGestures(
                 while (true) {
                     val event = awaitPointerEvent()
                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                    if (change.isConsumed) break
                     if (!change.pressed) {
                         change.consume()
-                        handleClick(change.uptimeMillis, mods)
+                        handleClick(change.uptimeMillis, mods, isTouch = false)
                         break
                     }
                     if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) {
@@ -234,20 +250,68 @@ fun Modifier.fileItemGestures(
                 }
             } else {
                 var up: PointerInputChange? = null
+                var cancelledOrScrolled = false
                 val finishedInTime = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
-                    up = waitForUpOrCancellation()
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id }
+                        if (change == null || change.isConsumed) {
+                            cancelledOrScrolled = true
+                            break
+                        }
+                        if (!change.pressed) {
+                            up = change
+                            break
+                        }
+                        if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) {
+                            cancelledOrScrolled = true
+                            break
+                        }
+                    }
                     true
                 }
-                if (finishedInTime == null) {
-                    currentOnContextMenu()
-                    do {
-                        val event = awaitPointerEvent()
-                        event.changes.forEach { it.consume() }
-                    } while (event.changes.any { it.pressed })
-                } else {
+                if (finishedInTime == null && !cancelledOrScrolled) {
+                    haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+                    // Nach Long-Press: Bewegt der Nutzer den Finger -> Drag & Drop starten.
+                    // Lässt er los oder hält 450 ms ruhig -> Kontextmenü öffnen.
+                    var dragStarted = false
+                    var releasedDuringHold = false
+                    withTimeoutOrNull(450L) {
+                        while (true) {
+                            val event = awaitPointerEvent()
+                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!change.pressed) {
+                                change.consume()
+                                releasedDuringHold = true
+                                break
+                            }
+                            if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop) {
+                                change.consume()
+                                dragStarted = true
+                                currentOnPrepareDrag()?.let { startTransfer(it) }
+                                break
+                            }
+                        }
+                    }
+                    if (!dragStarted) {
+                        currentOnContextMenu()
+                        if (!releasedDuringHold) {
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                change.consume()
+                                if (!change.pressed) break
+                                if ((change.position - down.position).getDistance() > viewConfiguration.touchSlop * 1.5f) {
+                                    currentOnPrepareDrag()?.let { startTransfer(it) }
+                                    break
+                                }
+                            }
+                        }
+                    }
+                } else if (!cancelledOrScrolled) {
                     up?.let {
                         it.consume()
-                        handleClick(it.uptimeMillis, mods)
+                        handleClick(it.uptimeMillis, mods, isTouch = true)
                     }
                 }
             }
