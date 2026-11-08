@@ -280,6 +280,7 @@ class ChromeFilesViewModel @Inject constructor(
     // ================================================================== Navigation
 
     fun onSidebarNodeClicked(node: SidebarTreeNode) {
+        repository.safVolumes.rememberFolderNode(path = node.path, name = node.title)
         focused?.navigateTo(node.path, node.volumeId)
         rebuildSidebar()
     }
@@ -294,6 +295,11 @@ class ChromeFilesViewModel @Inject constructor(
         val pane = panes[paneId] ?: return
         when {
             node.isDirectory -> {
+                repository.safVolumes.rememberFolderNode(
+                    path = node.path,
+                    name = node.name,
+                    parentPath = node.parentPath
+                )
                 val vol = if (node.volumeId in VIRTUAL_IDS) pane.resolveVolumeIdForPath(node.path) else node.volumeId
                 pane.navigateTo(node.path, vol)
                 rebuildSidebar()

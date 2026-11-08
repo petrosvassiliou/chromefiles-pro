@@ -234,7 +234,9 @@ class VirtualFileSystemRepository @Inject constructor(
             it.protocol == SafVolumeManager.PROTOCOL_SAF_LINUX || it.volumeId == SafVolumeManager.LINUX_SAF_VOLUME_ID
         }
         val driveSafConn = allConnections.firstOrNull {
-            it.protocol == SafVolumeManager.PROTOCOL_SAF_DRIVE || it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID
+            it.protocol == SafVolumeManager.PROTOCOL_SAF_DRIVE ||
+                it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID ||
+                it.hostOrUri.contains("com.google.android.apps.docs")
         }
 
         val driveAccount = driveManager.accountFlow.value
@@ -293,7 +295,8 @@ class VirtualFileSystemRepository @Inject constructor(
                 it.protocol == SafVolumeManager.PROTOCOL_SAF_LINUX ||
                     it.volumeId == SafVolumeManager.LINUX_SAF_VOLUME_ID ||
                     it.protocol == SafVolumeManager.PROTOCOL_SAF_DRIVE ||
-                    it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID
+                    it.volumeId == SafVolumeManager.DRIVE_SAF_VOLUME_ID ||
+                    it.volumeId == driveSafConn?.volumeId
             }
             .map { conn ->
                 if (conn.protocol == SafVolumeManager.PROTOCOL_SAF || safVolumes.isSafPath(conn.localMountPath)) {
@@ -714,35 +717,12 @@ class VirtualFileSystemRepository @Inject constructor(
                     else -> "Externer Ordner"
                 }
             val rootPath = _volumesFlow.value.firstOrNull { it.id == volumeId }?.rootPath ?: currentPath
-            if (currentPath == rootPath) {
-                return listOf(BreadcrumbSegment(title, rootPath, volumeId))
-            }
-            val segments = mutableListOf(BreadcrumbSegment(title, rootPath, volumeId))
-            val rootBody = rootPath.removePrefix("saf://")
-            val curBody = currentPath.removePrefix("saf://")
-            val volPrefix = curBody.substringBefore('/')
-            val rootDocId = Uri.decode(rootBody.substringAfter('/', ""))
-            val curDocId = Uri.decode(curBody.substringAfter('/', ""))
-            if (rootDocId.isNotEmpty() && curDocId.startsWith(rootDocId) && curDocId != rootDocId) {
-                val suffix = curDocId.removePrefix(rootDocId).trimStart('/', ':')
-                val sep = if (curDocId.startsWith("$rootDocId/")) "/" else ":"
-                var running = rootDocId
-                suffix.split('/').filter { it.isNotEmpty() }.forEachIndexed { idx, part ->
-                    running = if (idx == 0 && sep == ":") "$running:$part" else "$running/$part"
-                    segments += BreadcrumbSegment(
-                        title = part,
-                        path = "saf://$volPrefix/${Uri.encode(running)}",
-                        volumeId = volumeId
-                    )
-                }
-            } else {
-                segments += BreadcrumbSegment(
-                    title = curDocId.substringAfterLast('/').substringAfterLast(':').ifBlank { "Unterordner" },
-                    path = currentPath,
-                    volumeId = volumeId
-                )
-            }
-            return segments
+            return safVolumes.buildBreadcrumbsSync(
+                safPath = currentPath,
+                volumeId = volumeId,
+                rootTitle = title,
+                rootPath = rootPath
+            )
         }
 
         if (driveManager.isDriveApiPath(currentPath)) {

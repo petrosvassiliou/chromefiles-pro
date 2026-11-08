@@ -54,6 +54,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.runtime.remember
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
+import androidx.compose.ui.input.pointer.isAltPressed
+import androidx.compose.ui.input.pointer.isBackPressed
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.isMetaPressed
 import androidx.compose.ui.input.pointer.isShiftPressed
@@ -218,10 +220,16 @@ fun Modifier.fileItemGestures(
             val pressEvent = currentEvent
             val mods = pressEvent.keyboardModifiers
 
-            if (down.type == PointerType.Mouse) {
-                if (pressEvent.buttons.isSecondaryPressed) {
-                    down.consume()
-                    // Warten bis die rechte Maustaste losgelassen wird, damit das Popup nicht sofort schließt
+            // Sofortiger Rechtsklick für Googlebook OS / ChromeOS & Android:
+            // Funktioniert unabhängig vom PointerType (Mouse, Touchpad, Stylus) bei rechter Maustaste,
+            // Trackpad-Sekundärklick, Maus-Zurücktaste oder ChromeOS Alt + Klick.
+            val isImmediateRightClick = pressEvent.buttons.isSecondaryPressed ||
+                pressEvent.buttons.isBackPressed ||
+                (mods.isAltPressed && (pressEvent.buttons.isPrimaryPressed || down.pressed))
+            if (isImmediateRightClick) {
+                down.consume()
+                currentOnContextMenu()
+                withTimeoutOrNull(350L) {
                     while (true) {
                         val event = awaitPointerEvent()
                         event.changes.forEach { it.consume() }
@@ -229,12 +237,18 @@ fun Modifier.fileItemGestures(
                             break
                         }
                     }
-                    currentOnContextMenu()
-                    return@awaitEachGesture
                 }
-                if (!pressEvent.buttons.isPrimaryPressed) return@awaitEachGesture
+                return@awaitEachGesture
+            }
+
+            if (down.type == PointerType.Mouse) {
                 while (true) {
                     val event = awaitPointerEvent()
+                    if (event.buttons.isSecondaryPressed || event.buttons.isBackPressed) {
+                        event.changes.forEach { it.consume() }
+                        currentOnContextMenu()
+                        break
+                    }
                     val change = event.changes.firstOrNull { it.id == down.id } ?: break
                     if (change.isConsumed) break
                     if (!change.pressed) {
@@ -251,9 +265,21 @@ fun Modifier.fileItemGestures(
             } else {
                 var up: PointerInputChange? = null
                 var cancelledOrScrolled = false
+                var secondaryTriggered = false
+                var maxPointers = pressEvent.changes.count { it.pressed }.coerceAtLeast(1)
                 val finishedInTime = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
                     while (true) {
                         val event = awaitPointerEvent()
+                        val pressedNow = event.changes.count { it.pressed }
+                        if (pressedNow > maxPointers) maxPointers = pressedNow
+                        if (event.buttons.isSecondaryPressed ||
+                            event.buttons.isBackPressed ||
+                            event.keyboardModifiers.isAltPressed
+                        ) {
+                            event.changes.forEach { it.consume() }
+                            secondaryTriggered = true
+                            break
+                        }
                         val change = event.changes.firstOrNull { it.id == down.id }
                         if (change == null || change.isConsumed) {
                             cancelledOrScrolled = true
@@ -270,7 +296,11 @@ fun Modifier.fileItemGestures(
                     }
                     true
                 }
-                if (finishedInTime == null && !cancelledOrScrolled) {
+                if (secondaryTriggered || (maxPointers == 2 && !cancelledOrScrolled && finishedInTime != null)) {
+                    // Trackpad Zwei-Finger-Klick oder nachträglicher Sekundär-Button auf Googlebook OS
+                    up?.consume()
+                    currentOnContextMenu()
+                } else if (finishedInTime == null && !cancelledOrScrolled) {
                     haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                     // Nach Long-Press: Bewegt der Nutzer den Finger -> Drag & Drop starten.
                     // Lässt er los oder hält 450 ms ruhig -> Kontextmenü öffnen.

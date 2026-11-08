@@ -179,6 +179,7 @@ class PaneController(
                 val kept = st.selectedIds.intersect(valid)
                 st.copy(
                     nodes = result,
+                    breadcrumbs = repository.buildBreadcrumbs(st.currentPath, st.currentVolumeId),
                     isLoading = false,
                     selectedIds = kept,
                     leadSelectionId = st.leadSelectionId?.takeIf { it in kept },

@@ -117,6 +117,7 @@ import de.chromefiles.app.ui.viewmodel.FileViewMode
 import de.chromefiles.app.ui.viewmodel.PaneState
 import java.io.File
 import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.SharedFlow
 
 private val COMPACT_WINDOW_WIDTH = 760.dp
 private val DETAILS_PANEL_WIDTH = 320.dp
@@ -129,6 +130,7 @@ private val DETAILS_PANEL_WIDTH = 320.dp
 fun ChromeFilesScreen(
     incomingUri: Uri? = null,
     onConsumeIncomingUri: () -> Unit = {},
+    rightClickEvents: SharedFlow<Offset>? = null,
     viewModel: ChromeFilesViewModel = hiltViewModel()
 ) {
     val ui by viewModel.uiState.collectAsStateWithLifecycle()
@@ -138,9 +140,53 @@ fun ChromeFilesScreen(
     val snackbarHostState = remember { SnackbarHostState() }
     val rootFocus = remember { FocusRequester() }
     var rootIsFocused by remember { mutableStateOf(false) }
-    var lastPressPosition by remember { mutableStateOf(Offset.Zero) }
+    var lastPressPosition by remember { mutableStateOf(Offset(240f, 240f)) }
+    var lastContextMenuOpenedAtMillis by remember { mutableStateOf(0L) }
     val areaStates = remember { mutableMapOf<String, FileAreaState>() }
     fun areaState(paneId: String) = areaStates.getOrPut(paneId) { FileAreaState() }
+
+    LaunchedEffect(ui.contextMenu) {
+        if (ui.contextMenu != null) {
+            lastContextMenuOpenedAtMillis = System.currentTimeMillis()
+        }
+    }
+
+    LaunchedEffect(rightClickEvents) {
+        rightClickEvents?.collect { windowPos ->
+            if (windowPos.x > 0f || windowPos.y > 0f) {
+                lastPressPosition = windowPos
+            }
+            val now = System.currentTimeMillis()
+            val curState = viewModel.uiState.value
+            // Falls Compose den Rechtsklick bereits verarbeitet hat, nicht doppelt öffnen
+            if (curState.contextMenu != null && now - lastContextMenuOpenedAtMillis < 250L) {
+                return@collect
+            }
+            val visiblePaneIds = listOfNotNull(
+                curState.activeTabPaneId.takeIf { it.isNotEmpty() },
+                curState.splitPaneId
+            )
+            var matchedPaneId: String? = null
+            var matchedNodeId: String? = null
+            for (paneId in visiblePaneIds) {
+                val (inBounds, nodeId) = areaState(paneId).hitTestWindowPosition(lastPressPosition)
+                if (inBounds) {
+                    matchedPaneId = paneId
+                    matchedNodeId = nodeId
+                    break
+                }
+            }
+            val targetPaneId = matchedPaneId ?: curState.focusedPaneId.takeIf { it.isNotEmpty() } ?: return@collect
+            val controller = viewModel.pane(targetPaneId) ?: return@collect
+            val hitNode = if (matchedPaneId != null) {
+                matchedNodeId?.let { id -> controller.current.nodes.firstOrNull { it.id == id } }
+            } else {
+                controller.current.leadNode
+            }
+            lastContextMenuOpenedAtMillis = now
+            viewModel.showContextMenu(targetPaneId, hitNode)
+        }
+    }
 
     // Automatische Prüfung der Dateiberechtigung beim Zurückkehren aus den Android-Einstellungen
     DisposableEffect(lifecycleOwner) {
@@ -419,8 +465,9 @@ fun ChromeFilesScreen(
                 awaitPointerEventScope {
                     while (true) {
                         val event = awaitPointerEvent(PointerEventPass.Initial)
-                        if (event.type == PointerEventType.Press) {
-                            event.changes.firstOrNull()?.let { lastPressPosition = it.position }
+                        val pos = event.changes.firstOrNull()?.position
+                        if (pos != null && (event.type == PointerEventType.Press || viewModel.uiState.value.contextMenu == null)) {
+                            lastPressPosition = pos
                         }
                     }
                 }

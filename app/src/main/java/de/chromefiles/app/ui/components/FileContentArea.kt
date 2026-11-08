@@ -81,6 +81,8 @@ import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.isAltPressed
+import androidx.compose.ui.input.pointer.isBackPressed
 import androidx.compose.ui.input.pointer.isCtrlPressed
 import androidx.compose.ui.input.pointer.isMetaPressed
 import androidx.compose.ui.input.pointer.isPrimaryPressed
@@ -141,6 +143,21 @@ class FileAreaState {
 
     fun hitTest(position: Offset): String? = itemRects().entries.firstOrNull { it.value.contains(position) }?.key
 
+    /**
+     * Prüft anhand einer Fenster-Koordinate (z. B. aus `MainActivity.dispatchGenericMotionEvent` / Rechtsklick),
+     * ob der Klick in diesem Dateibereich lag und welches Datei-/Ordner-Element getroffen wurde.
+     */
+    fun hitTestWindowPosition(windowPosition: Offset): Pair<Boolean, String?> {
+        val container = containerCoordinates?.takeIf { it.isAttached } ?: return false to null
+        val localPos = runCatching { container.windowToLocal(windowPosition) }.getOrNull() ?: return false to null
+        val inBounds = localPos.x >= 0f &&
+            localPos.y >= 0f &&
+            localPos.x <= container.size.width.toFloat() &&
+            localPos.y <= container.size.height.toFloat()
+        if (!inBounds) return false to null
+        return true to hitTest(localPos)
+    }
+
     /** Nächstes Element ober-/unterhalb von [leadId] (Rasteransicht, Pfeil hoch/runter). */
     fun verticalNeighbor(leadId: String, up: Boolean): String? {
         val rects = itemRects()
@@ -168,7 +185,7 @@ private fun Modifier.trackItem(state: FileAreaState, id: String): Modifier {
 /**
  * Container-Modifier für den Dateibereich:
  * - Maus links auf freier Fläche + Ziehen: Gummiband-Auswahl (mit Strg/Umschalt additiv), Klick: Auswahl aufheben.
- * - Maus rechts auf freier Fläche: Hintergrund-Kontextmenü.
+ * - Maus rechts / Trackpad-Sekundärklick / Alt+Klick auf freier Fläche: Hintergrund-Kontextmenü.
  * - Touch-Tipp auf freier Fläche: Auswahl aufheben (Scrollen bleibt unberührt).
  */
 @Composable
@@ -229,10 +246,15 @@ fun Modifier.fileAreaPointerHandling(
                 currentOnPointerDown()
                 if (state.hitTest(down.position) != null) return@awaitEachGesture
                 val pressEvent = currentEvent
+                val mods = pressEvent.keyboardModifiers
 
-                if (down.type == PointerType.Mouse) {
-                    if (pressEvent.buttons.isSecondaryPressed) {
-                        down.consume()
+                val isRightClick = pressEvent.buttons.isSecondaryPressed ||
+                    pressEvent.buttons.isBackPressed ||
+                    (mods.isAltPressed && (pressEvent.buttons.isPrimaryPressed || down.pressed))
+                if (isRightClick) {
+                    down.consume()
+                    currentOnBackgroundMenu()
+                    withTimeoutOrNull(350L) {
                         while (true) {
                             val event = awaitPointerEvent(PointerEventPass.Initial)
                             event.changes.forEach { it.consume() }
@@ -240,9 +262,11 @@ fun Modifier.fileAreaPointerHandling(
                                 break
                             }
                         }
-                        currentOnBackgroundMenu()
-                        return@awaitEachGesture
                     }
+                    return@awaitEachGesture
+                }
+
+                if (down.type == PointerType.Mouse) {
                     if (!pressEvent.buttons.isPrimaryPressed) return@awaitEachGesture
                     val mods = pressEvent.keyboardModifiers
                     val additive = mods.isCtrlPressed || mods.isMetaPressed || mods.isShiftPressed
