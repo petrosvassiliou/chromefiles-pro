@@ -19,3 +19,4 @@ app/keystore/
 Thumbs.db
 *~
 *.swp
+.kotlin/
